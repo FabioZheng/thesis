@@ -1,0 +1,5 @@
+
+slurm/
+slurm_dylan/pretraining.sh
+slurm_dylan/pretraining_gpu.sh
+.DS_Store
