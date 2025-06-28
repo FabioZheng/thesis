@@ -1,4 +1,5 @@
 import torch
+from transformers import AutoTokenizer
 from modeling_cocom import COCOM, COCOMConfig
 
 # Step 1: Define the configuration and initialize the model
@@ -9,35 +10,35 @@ config = COCOMConfig(
     compr_linear_type="concat",
     quantization="no",
     generation_top_k=1,
-    lora=False
+    lora=False,
+    attn_implementation=None  # Explicitly disable Flash Attention
 )
 
-# Check if GPU is available
+# Step 2: Setup device and model
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(device)
-
-# Modify the configuration to disable flash attention if running on CPU
-if device.type == "cpu":
-    config.attn_implementation = None  # Disable flash attention
-
-# Initialize the model and move it to the appropriate device
 model = COCOM(config).to(device)
+model.eval()
 
-# Step 2: Prepare dummy input data
-batch_size = 2
-enc_input_ids = torch.randint(0, 1000, (batch_size, 128)).to(device)
-enc_attention_mask = torch.ones_like(enc_input_ids).to(device)
-dec_input_ids = torch.randint(0, 1000, (batch_size, 64)).to(device)
-dec_attention_mask = torch.ones_like(dec_input_ids).to(device)
-labels = torch.randint(0, 1000, (batch_size, 64)).to(device)
+# Step 3: Load tokenizers
+encoder_tokenizer = AutoTokenizer.from_pretrained(config.compr_model_name)
+decoder_tokenizer = AutoTokenizer.from_pretrained(config.decoder_model_name)
 
-# Step 3: Test the forward pass
-output = model(
-    enc_input_ids=enc_input_ids,
-    enc_attention_mask=enc_attention_mask,
-    dec_input_ids=dec_input_ids,
-    dec_attention_mask=dec_attention_mask,
-    labels=labels
-)
-print("Loss:", output["loss"])
-print("Logits shape:", output["logits"].shape)
+# Step 4: Prepare input question
+question = "What is the capital of Italy?"
+enc = encoder_tokenizer(question, return_tensors="pt", padding=True, truncation=True).to(device)
+enc_input_ids = enc["input_ids"]
+enc_attention_mask = enc["attention_mask"]
+
+# Step 5: Generate answer from the model
+with torch.no_grad():
+    generated = model.generate(
+        enc_input_ids=enc_input_ids,
+        enc_attention_mask=enc_attention_mask,
+        max_new_tokens=32,
+        do_sample=False  # Greedy decoding
+    )
+
+# Step 6: Decode and print result
+answer = decoder_tokenizer.batch_decode(generated, skip_special_tokens=True)[0]
+print("Question:", question)
+print("Answer:", answer)

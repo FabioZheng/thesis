@@ -1,5 +1,6 @@
 from transformers import Trainer, TrainingArguments
 import datasets
+from datasets import Dataset
 import os
 from custom_parser import get_args
 from rouge import Rouge
@@ -158,13 +159,17 @@ def main():
     if accelerator.is_main_process:
         print(model)
 
-    dataset = dataset.map(pretrain_tokenize_function, batched=True,
-                          fn_kwargs={
-                              "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
-                              "decoder_tokenizer": model.decoder_tokenizer,
-                              "tc_ratio": args.tc_ratio,
-                              "max_len": args.doc_max_length,
-                              "compression_rates": args.compression_rates})
+    dataset['train'] = dataset['train'].map(
+        pretrain_tokenize_function,
+        batched=True,
+        fn_kwargs={
+            "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
+            "decoder_tokenizer": model.decoder_tokenizer,
+            "tc_ratio": args.tc_ratio,
+            "max_len": args.doc_max_length,
+            "compression_rates": args.compression_rates
+        }
+    )
 
     dataset['train'] = dataset['train'].shuffle(seed=42)
 
