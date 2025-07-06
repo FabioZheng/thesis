@@ -4,6 +4,7 @@ import torch
 import math
 from peft import get_peft_model, LoraConfig, TaskType
 import os
+from modules.cmab_agent import batch_entropy
 
 
 def freeze_model(model):
@@ -29,33 +30,42 @@ class BERT_Compressor(torch.nn.Module):
                 linear = torch.nn.Linear(self.model.config.hidden_size, decoder_hidden_size)
             self.linears.append(linear.bfloat16())
 
-    def forward(self, input_ids, attention_mask):
-        segment_compress_outputs = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                                              output_hidden_states=True)
+    def _compress_rate(self, segment_compress_outputs, input_ids, rate, idx):
+        num_embs = math.ceil(input_ids.size(1) / rate)
+        hidden_states = []
+
+        if self.compressing_mode == 'concat':
+            for segment_idx in range(num_embs):
+                start_idx = segment_idx * rate
+                end_idx = (segment_idx + 1) * rate
+                hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
+                hidden_state_concat = torch.flatten(hidden_state, start_dim=1)
+                hidden_states.append(hidden_state_concat)
+        elif self.compressing_mode == "mean":
+            for segment_idx in range(num_embs):
+                start_idx = segment_idx * rate
+                end_idx = (segment_idx + 1) * rate
+                hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
+                hidden_state_mean = torch.mean(hidden_state, dim=1)
+                hidden_states.append(hidden_state_mean)
+
+        hidden_states = torch.stack(hidden_states, dim=1)
+        return self.linears[idx](hidden_states)
+
+    def forward(self, input_ids, attention_mask, rate=None):
+        segment_compress_outputs = self.model(
+            input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
+        )
+
+        if rate is not None:
+            if rate not in self.compr_rates:
+                raise ValueError("Requested rate not initialized in compressor")
+            idx = self.compr_rates.index(rate)
+            return self._compress_rate(segment_compress_outputs, input_ids, rate, idx)
 
         all_results = []
-        for i, rate in enumerate(self.compr_rates):
-            num_embs = math.ceil(input_ids.size(1) / rate)
-            all_hidden_states_emb = []
-
-            if self.compressing_mode == 'concat':
-                for segment_idx in range(num_embs):
-                    start_idx = segment_idx * rate
-                    end_idx = (segment_idx + 1) * rate
-                    hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
-                    hidden_state_concat = torch.flatten(hidden_state, start_dim=1)
-                    all_hidden_states_emb.append(hidden_state_concat)
-            elif self.compressing_mode == "mean":
-                for segment_idx in range(num_embs):
-                    start_idx = segment_idx * rate
-                    end_idx = (segment_idx + 1) * rate
-                    hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
-                    hidden_state_mean = torch.mean(hidden_state, dim=1)
-                    all_hidden_states_emb.append(hidden_state_mean)
-
-            all_hidden_states_emb_cat = torch.stack(all_hidden_states_emb, dim=1)
-            transformed_embeds = self.linears[i](all_hidden_states_emb_cat)
-            all_results.append(transformed_embeds)
+        for i, r in enumerate(self.compr_rates):
+            all_results.append(self._compress_rate(segment_compress_outputs, input_ids, r, i))
 
         return all_results  # Returns a list of compressed embeddings for each rate
 
@@ -192,11 +202,24 @@ class COCOM(PreTrainedModel):
         self.sep = cfg.sep
         self.compr_rates = cfg.compr_rates
         self.local_rank = os.getenv('LOCAL_RANK', '0')
+        self.current_rate = self.compr_rates[0]
+        self.bandit_agent = None
+
+    def set_bandit_agent(self, agent):
+        """Attach a bandit agent that selects the compression rate."""
+        self.bandit_agent = agent
 
     def compress_and_replace_emb(self, enc_input_ids, enc_attention_mask, dec_input_ids):
         indices = range(0, enc_input_ids.size(0) + 1, self.generation_top_k)
         if self.compr:
-            compressed_embs = self.compr(enc_input_ids, enc_attention_mask)
+            if self.bandit_agent is not None:
+                entropies = batch_entropy(enc_input_ids, enc_attention_mask)
+                avg_entropy = sum(entropies) / len(entropies)
+                rate = self.bandit_agent.select_rate(avg_entropy)
+                self.current_rate = rate
+            else:
+                rate = self.current_rate
+            compressed_embs = self.compr(enc_input_ids, enc_attention_mask, rate=rate)
             input_embeds = self.replace_embeddings(compressed_embs, dec_input_ids, indices)
         else:
             compressed_embs = self.compr_decoder(enc_input_ids, enc_attention_mask)
@@ -294,16 +317,21 @@ class COCOM(PreTrainedModel):
         flat_contexts = sum(contexts, [])
         # tokenize the contexts, depending if compr exist or not
         if self.compr is not None:
-            enc_input = self.compr.tokenizer(flat_contexts, padding=True, truncation=True, return_tensors='pt',
-                                             pad_to_multiple_of=self.compr_rate)
-            num_mem_tokens = math.ceil(enc_input['input_ids'].size(1) / self.compr_rates[0])
+            enc_input = self.compr.tokenizer(
+                flat_contexts,
+                padding=True,
+                truncation=True,
+                return_tensors='pt',
+                pad_to_multiple_of=self.current_rate
+            )
+            num_mem_tokens = math.ceil(enc_input['input_ids'].size(1) / self.current_rate)
         else:
             # first need to add special token in flat_contexts
             flat_contexts = [
                 self.decoder_tokenizer.enc_token + self.decoder_tokenizer.bos_token + context + self.decoder_tokenizer.bos_token
                 for context in flat_contexts]
             enc_input = self.decoder_tokenizer(flat_contexts, truncation=True, return_tensors='pt', padding="longest")
-            num_mem_tokens = math.ceil((enc_input['input_ids'].size(1) - 3) / self.compr_rates[0])
+            num_mem_tokens = math.ceil((enc_input['input_ids'].size(1) - 3) / self.current_rate)
             mem_tokens = torch.full((enc_input['input_ids'].size(0), num_mem_tokens),
                                     self.decoder_tokenizer.mem_token_id, dtype=torch.long)
             enc_input['input_ids'] = torch.cat([mem_tokens, enc_input['input_ids']], dim=1)
