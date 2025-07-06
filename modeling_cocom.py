@@ -140,10 +140,12 @@ class COCOM(PreTrainedModel):
         # when compr_model_name is not set, then means using a decoder-based compressor, otherwise a bert based compressor
         if cfg.compr_model_name is not None:
             # case bert based compressor
+            print("Using bert-based compressor")
             self.compr = BERT_Compressor(cfg.compr_model_name, cfg.compr_rates, cfg.compr_linear_type,
                                          self.decoder.config.hidden_size)
         else:
             # case decoder based compressor
+            print("Using decoder-based compressor")
             self.compr = None
 
         # set lora adaptors

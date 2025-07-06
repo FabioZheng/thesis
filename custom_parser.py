@@ -3,7 +3,7 @@ import argparse
 def get_args():
     parser = argparse.ArgumentParser(description="Training Configuration")
     parser.add_argument("--doc_max_length", type=int, default=128)
-    parser.add_argument("--compressor_model_name", type=str, default="bert-base-uncased")
+    parser.add_argument("--compressor_model_name", type=str, default=None)
     parser.add_argument("--decoder_model_name", type=str,
                         default="neuralmagic/DeepSeek-R1-Distill-Llama-8B-FP8-dynamic")
     parser.add_argument("--per_device_batch_size", type=int, default=8)

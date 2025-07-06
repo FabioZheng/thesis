@@ -1,6 +1,5 @@
 from transformers import Trainer, TrainingArguments
 import datasets
-from datasets import Dataset
 import os
 from custom_parser import get_args
 from rouge import Rouge
@@ -92,12 +91,7 @@ def pretrain_tokenize_function(examples,
                                tc_ratio=0.0,
                                compression_rates=[64],  # Now accepts list
                                max_len=512):
-    texts = examples["text"]
-    # Fake continuation = repeat same text
-    examples = {
-        "text": texts,
-        "next_text": texts
-    }
+
 
     ae = random.random() >= tc_ratio
     # For multiple compression rates, we'll use the first one for tokenization
@@ -126,19 +120,37 @@ def main():
         run_name = f'{args.compressor_model_name}_{args.decoder_model_name}_{args.compression_rates}_{args.tc_ratio}_{lora}_{args.lr}_{folder_name}'
         wandb.init(project="COCOM Pretrain", name=run_name)
 
-    dataset = datasets.load_dataset("openwebtext", split="train", streaming=True)
-
     from itertools import islice
 
-    # Split manually
-    train_stream = islice(dataset, 10000)
-    test_stream = islice(dataset, 1000)
+    # Load streaming dataset
+    dataset_stream = datasets.load_dataset("openwebtext", split="train", streaming=True)
 
-    # Turn streams into datasets
-    dataset = {
-        'train': datasets.Dataset.from_list(list(train_stream)),
-        'test': datasets.Dataset.from_list(list(test_stream))
-    }
+    def split_text_row(example):
+        """
+        Split the 'text' field into two halves:
+        - First half → 'text'
+        - Second half → 'next_text'
+        """
+        original_text = example["text"]
+        midpoint = len(original_text) // 2
+        return {
+            "text": original_text[:midpoint],
+            "next_text": original_text[midpoint:]
+        }
+
+    # Take subsets from the stream
+    train_stream = islice(dataset_stream, 10000)
+    test_stream = islice(dataset_stream, 1000)
+
+    # Materialize and split text fields
+    train_data = [split_text_row(row) for row in train_stream]
+    test_data = [split_text_row(row) for row in test_stream]
+
+    # Turn into DatasetDict
+    dataset = datasets.DatasetDict({
+        'train': datasets.Dataset.from_list(train_data),
+        'test': datasets.Dataset.from_list(test_data)
+    })
 
     dataset['train'] = dataset['train'].select(range(min(100000, len(dataset['train']))))
     dataset['test'] = dataset['test'].select(range(min(32, len(dataset['test']))))
@@ -159,7 +171,7 @@ def main():
     if accelerator.is_main_process:
         print(model)
 
-    dataset['train'] = dataset['train'].map(
+    dataset = dataset.map(
         pretrain_tokenize_function,
         batched=True,
         fn_kwargs={
@@ -195,6 +207,7 @@ def main():
     total_batch_size = args.per_device_batch_size * torch.cuda.device_count() * args.gradient_accumulation
     total_steps = len(dataset['train']) // total_batch_size
     save_steps = max(total_steps // args.num_save_steps, 1)
+    print(save_steps)
     training_args.save_steps = save_steps
     training_args.logging_steps = 10
     training_args.eval_steps = 10
