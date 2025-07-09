@@ -15,6 +15,7 @@ import shutil
 import wandb
 from accelerate import Accelerator
 import torch
+from cmab_agent import CompressionBanditAgent
 
 random.seed(42)
 
@@ -139,8 +140,8 @@ def main():
         }
 
     # Take subsets from the stream
-    train_stream = islice(dataset_stream, 10000)
-    test_stream = islice(dataset_stream, 1000)
+    train_stream = islice(dataset_stream, 1000)
+    test_stream = islice(dataset_stream, 32)
 
     # Materialize and split text fields
     train_data = [split_text_row(row) for row in train_stream]
@@ -170,6 +171,8 @@ def main():
     model = COCOM(cfg)
     if accelerator.is_main_process:
         print(model)
+    bandit = CompressionBanditAgent(rates=args.compression_rates)
+    model.set_bandit_agent(bandit)
 
     dataset = dataset.map(
         pretrain_tokenize_function,
@@ -230,6 +233,7 @@ def main():
     last_checkpoint = None
     if os.path.isdir(training_args.output_dir) and not training_args.overwrite_output_dir:
         last_checkpoint = get_last_checkpoint(training_args.output_dir)
+        print(f"Last checkpoint found: {last_checkpoint},{training_args.output_dir}")
         if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
             print(f"Checkpoint detected, resuming training at {last_checkpoint}.")
 
