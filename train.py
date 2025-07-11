@@ -112,7 +112,7 @@ def main():
     args = get_args()
     rouge = Rouge()
 
-    folder_name = f'{Hasher.hash(str(args))}'
+    folder_name = 'new'
     output_dir = f"{args.experiment_folder}/tmp_{folder_name}"
     model_output_dir = output_dir + '/train/'
     lora = args.lora.lower() == 'true'
