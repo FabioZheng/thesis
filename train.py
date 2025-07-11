@@ -71,13 +71,11 @@ def compute_metrics(eval_pred, model, rouge):
     preds_str = original_model.decoder_tokenizer.batch_decode(preds, skip_special_tokens=True)
     labels_str = original_model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    '''
-    for pre, lab in zip(preds_str[:2], labels_str[:2]):
-        print('label: ', lab)
-        print('pred: ', pre)
+    # Print a short preview of prediction vs. reference during evaluation
+    for pred_str, label_str in zip(preds_str[:2], labels_str[:2]):
+        print('pred:', pred_str[:100])
+        print('text:', label_str[:100])
         print()
-    print('_' * 15)
-    '''
     metrics = {}
     rouge_scores = compute_rouge_scores(rouge, preds_str, labels_str)
     em = exact_match_score(preds_str, labels_str)
