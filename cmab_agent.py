@@ -2,6 +2,7 @@ import math
 from collections import Counter
 from typing import Iterable, List
 import numpy as np
+import torch
 
 class CompressionBanditAgent:
     """Simple contextual multi-armed bandit using linear UCB."""
@@ -41,3 +42,34 @@ def batch_entropy(input_ids, attention_mask) -> List[float]:
         ent = -sum(p * math.log(p, 2) for p in probs)
         entropies.append(ent)
     return entropies
+
+
+def batch_perplexity(model, input_ids, attention_mask) -> List[float]:
+    """Compute the perplexity of each document in a batch.
+
+    Parameters
+    ----------
+    model : transformers.PreTrainedModel
+        Language model used to compute the likelihood of the documents.
+    input_ids : torch.LongTensor
+        Token ids of shape ``(batch_size, seq_len)``.
+    attention_mask : torch.LongTensor
+        Attention mask with the same shape as ``input_ids``.
+
+    Returns
+    -------
+    List[float]
+        Perplexity score for every document.
+    """
+
+    device = next(model.parameters()).device
+    perplexities = []
+    model.eval()
+    with torch.no_grad():
+        for ids, mask in zip(input_ids, attention_mask):
+            ids = ids.to(device)
+            mask = mask.to(device)
+            outputs = model(input_ids=ids.unsqueeze(0), attention_mask=mask.unsqueeze(0), labels=ids.unsqueeze(0))
+            loss = outputs.loss
+            perplexities.append(float(math.exp(loss.item())))
+    return perplexities
