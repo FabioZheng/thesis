@@ -3,14 +3,14 @@ import os
 import math
 import pickle
 import matplotlib.pyplot as plt
-from rouge import Rouge
+from measures import reward as compute_reward
 import datasets
 import torch
 from torch.utils.data import DataLoader
 
 from modeling_cocom import COCOM
 from cmab_agent import CompressionBanditAgent, batch_entropy
-from metrics import exact_match_score,compute_rouge_scores
+from metrics import exact_match_score
 from utils import prepare_auto_encoding
 
 
@@ -59,8 +59,6 @@ def main():
 
     # 📈 To store rewards for plotting
     rewards_history = []
-    rouge=Rouge()
-
     for rate in model.compr_rates:
         print(f"\n🔵 Compression Rate: {rate}")
         prepped = dataset.map(
@@ -94,11 +92,9 @@ def main():
 
             entropies = batch_entropy(batch["enc_input_ids"].cpu(), batch["enc_attention_mask"].cpu())
             for ent, pred, gold in zip(entropies, preds, texts):
-                acc = compute_rouge_scores(rouge,[pred], [gold])
-                acc=acc['Rouge-1']
-                reward = acc * math.sqrt(rate)
-                agent.update(ent, rate, reward)
-                batch_rewards.append(reward)
+                r = compute_reward([pred], [gold], rate)
+                agent.update(ent, rate, r)
+                batch_rewards.append(r)
 
             # Print progress every 50 steps
             if (idx + 1) % 2 == 0:
