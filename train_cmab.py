@@ -27,7 +27,7 @@ def collate_batch(batch):
 def get_args():
     parser = argparse.ArgumentParser(description="Train contextual bandit for compression rate selection")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained COCOM checkpoint")
-    parser.add_argument("--dataset_name_or_dir", type=str, default="squad", help="HF dataset or local path")
+    parser.add_argument("--dataset_name_or_dir", type=str, default="ms_marco", help="HF dataset or local path")
     parser.add_argument("--doc_max_length", type=int, default=128, help="Maximum document length")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--num_examples", type=int, default=1024, help="Number of training examples")
@@ -51,12 +51,26 @@ def main():
     if os.path.exists(args.dataset_name_or_dir):
         dataset = datasets.load_from_disk(args.dataset_name_or_dir)
     else:
-        dataset = datasets.load_dataset(args.dataset_name_or_dir)
+        dataset = datasets.load_dataset(args.dataset_name_or_dir, "v2.1")
     dataset = dataset["train"].select(range(args.num_examples))
+    print(dataset[:5])  # show first 5 rows
+
+    if "passages" in dataset.column_names:
+        def get_first_passage(example):
+            return {"text": example["passages"]["passage_text"]}
+        dataset = dataset.map(get_first_passage)
+        print(dataset[:5])  # show first 5 rows
+
+        flattened = [s for sublist in dataset["text"] for s in sublist]
+        new_data = {"text": flattened}
+
+        dataset = datasets.Dataset.from_dict(new_data)
     if "context" in dataset.column_names:
         dataset = dataset.rename_column("context", "text")
     dataset = dataset.remove_columns([c for c in dataset.column_names if c != "text"])
 
+    print(dataset[:5])  # show first 5 rows
+    exit()
     # 📈 To store rewards for plotting
     rewards_history = []
     rouge=Rouge()
@@ -128,4 +142,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

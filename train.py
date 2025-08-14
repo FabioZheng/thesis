@@ -71,13 +71,11 @@ def compute_metrics(eval_pred, model, rouge):
     preds_str = original_model.decoder_tokenizer.batch_decode(preds, skip_special_tokens=True)
     labels_str = original_model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
-    '''
-    for pre, lab in zip(preds_str[:2], labels_str[:2]):
-        print('label: ', lab)
-        print('pred: ', pre)
+    # Print a short preview of prediction vs. reference during evaluation
+    for pred_str, label_str in zip(preds_str[:2], labels_str[:2]):
+        print('pred:', pred_str[:100])
+        print('text:', label_str[:100])
         print()
-    print('_' * 15)
-    '''
     metrics = {}
     rouge_scores = compute_rouge_scores(rouge, preds_str, labels_str)
     em = exact_match_score(preds_str, labels_str)
@@ -90,7 +88,7 @@ def pretrain_tokenize_function(examples,
                                compressor_tokenizer,
                                decoder_tokenizer,
                                tc_ratio=0.0,
-                               compression_rates=[64],  # Now accepts list
+                               compression_rates=[],  # Now accepts list
                                max_len=512):
 
 
@@ -111,6 +109,9 @@ def main():
     accelerator = Accelerator()
     args = get_args()
     rouge = Rouge()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\nUsing device: {device}")
 
     folder_name = 'new'
     output_dir = f"{args.experiment_folder}/tmp_{folder_name}"
@@ -140,7 +141,7 @@ def main():
         }
 
     # Take subsets from the stream
-    train_stream = islice(dataset_stream, 1000)
+    train_stream = islice(dataset_stream, 10000)
     test_stream = islice(dataset_stream, 32)
 
     # Materialize and split text fields
@@ -193,7 +194,7 @@ def main():
         learning_rate=args.lr,
         eval_accumulation_steps=args.gradient_accumulation,
         per_device_train_batch_size=args.per_device_batch_size,
-        per_device_eval_batch_size=max(args.per_device_batch_size // 4, 1),
+        per_device_eval_batch_size=args.per_device_batch_size,
         remove_unused_columns=False,
         gradient_accumulation_steps=args.gradient_accumulation,
         eval_strategy='steps',

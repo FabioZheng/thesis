@@ -1,0 +1,16 @@
+accelerate
+bitsandbytes
+datasets
+flash-attn
+matplotlib
+numpy
+peft
+pyserini
+regex
+rouge
+scikit-learn
+torch
+transformers
+tqdm
+wandb
+vllm
