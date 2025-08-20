@@ -52,6 +52,21 @@ class CustomTrainer(Trainer):
         return (loss, outputs) if return_outputs else loss
 
 
+def collate_batch(batch):
+    ret = {}
+    for key in batch[0]:
+        if isinstance(batch[0][key], dict):
+            ret[key] = {
+                subk: torch.stack([torch.tensor(item[key][subk]) for item in batch])
+                for subk in batch[0][key]
+            }
+        elif 'text' not in key:
+            ret[key] = torch.stack([torch.tensor(item[key]) for item in batch])
+        else:
+            ret[key] = [item[key] for item in batch]
+    return ret
+
+
 def compute_metrics(eval_pred, model, rouge):
     # Handle multiple logits from different compression rates
     logits_list, labels = eval_pred
@@ -84,25 +99,37 @@ def compute_metrics(eval_pred, model, rouge):
     return metrics
 
 
-def pretrain_tokenize_function(examples,
-                               compressor_tokenizer,
-                               decoder_tokenizer,
-                               tc_ratio=0.0,
-                               compression_rates=[],  # Now accepts list
-                               max_len=512):
+def pretrain_tokenize_function(
+    examples,
+    compressor_tokenizer,
+    decoder_tokenizer,
+    tc_ratio=0.0,
+    compression_rates=None,
+    max_len=512,
+):
 
+    if compression_rates is None:
+        compression_rates = [1]
 
     ae = random.random() >= tc_ratio
-    # For multiple compression rates, we'll use the first one for tokenization
-    # since the actual compression happens in the model
-    compression_rate = compression_rates[0] if isinstance(compression_rates, list) else compression_rates
-
     if ae:
-        return prepare_auto_encoding(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len,
-                                     train=True)
+        return prepare_auto_encoding(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
     else:
-        return prepare_text_continuation(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len,
-                                         train=True)
+        return prepare_text_continuation(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
 
 
 def main():
@@ -222,7 +249,8 @@ def main():
         args=training_args,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'],
-        compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge)
+        compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge),
+        data_collator=collate_batch,
     )
 
     trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)

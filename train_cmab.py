@@ -17,7 +17,12 @@ from utils import prepare_auto_encoding
 def collate_batch(batch):
     ret = {}
     for key in batch[0]:
-        if 'text' not in key:
+        if isinstance(batch[0][key], dict):
+            ret[key] = {
+                subk: torch.stack([torch.tensor(item[key][subk]) for item in batch])
+                for subk in batch[0][key]
+            }
+        elif 'text' not in key:
             ret[key] = torch.stack([torch.tensor(item[key]) for item in batch])
         else:
             ret[key] = [item[key] for item in batch]
@@ -84,7 +89,7 @@ def main():
             fn_kwargs={
                 "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
                 "decoder_tokenizer": model.decoder_tokenizer,
-                "compression_rate": rate,
+                "compression_rates": [rate],
                 "enc_max_len": args.doc_max_length,
                 "train": False,
             },

@@ -253,39 +253,57 @@ class COCOM(PreTrainedModel):
     def forward(self,
                 enc_input_ids: torch.LongTensor = None,
                 enc_attention_mask: torch.LongTensor = None,
-                dec_input_ids: torch.LongTensor = None,
-                dec_attention_mask: torch.LongTensor = None,
-                labels: torch.LongTensor = None):
+                dec_input_ids = None,
+                dec_attention_mask = None,
+                labels = None):
 
         # Get compressed embeddings for all rates
         if self.compr:
-
             all_compressed_embs = self.compr(enc_input_ids, enc_attention_mask)
         else:
             all_compressed_embs = [self.compr_decoder(enc_input_ids, enc_attention_mask)]
 
+        # Prepare decoder inputs for each rate
+        if isinstance(dec_input_ids, dict):
+            def _get(d, k):
+                return d.get(k, d.get(str(k)))
+
+            dec_ids_list = [_get(dec_input_ids, r) for r in self.config.compr_rates]
+            dec_mask_list = [_get(dec_attention_mask, r) for r in self.config.compr_rates]
+            label_list = (
+                [_get(labels, r) for r in self.config.compr_rates]
+                if labels is not None
+                else [None] * len(dec_ids_list)
+            )
+        elif isinstance(dec_input_ids, (list, tuple)):
+            dec_ids_list = list(dec_input_ids)
+            dec_mask_list = list(dec_attention_mask)
+            label_list = list(labels) if labels is not None else [None] * len(dec_ids_list)
+        else:
+            dec_ids_list = [dec_input_ids] * len(all_compressed_embs)
+            dec_mask_list = [dec_attention_mask] * len(all_compressed_embs)
+            label_list = [labels] * len(all_compressed_embs)
 
         total_loss = 0
         all_logits = []
 
         # Process each compression rate
-        for compressed_embs in all_compressed_embs:
+        for compressed_embs, dec_ids, dec_mask, lab in zip(all_compressed_embs, dec_ids_list, dec_mask_list, label_list):
             indices = range(0, enc_input_ids.size(0) + 1, self.generation_top_k)
-            inputs_embeds = self.replace_embeddings(compressed_embs, dec_input_ids, indices)
+            inputs_embeds = self.replace_embeddings(compressed_embs, dec_ids, indices)
 
             if (self.training_form == "compressor") and (self.compr is None):
                 inputs_embeds = inputs_embeds.detach()
 
             decoder_outputs = self.decoder(
                 inputs_embeds=inputs_embeds,
-                attention_mask=dec_attention_mask,
-                labels=labels
+                attention_mask=dec_mask,
+                labels=lab,
             )
 
             total_loss += decoder_outputs.loss
             all_logits.append(decoder_outputs.logits)
-        #print(f"Number of rates: {len(all_compressed_embs)}")
-        # Average the loss across all compression rates
+
         avg_loss = total_loss / len(all_compressed_embs)
 
         return {"loss": avg_loss, "logits": all_logits}  # Returns average loss and list of logits

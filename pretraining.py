@@ -48,6 +48,21 @@ class CustomTrainer(Trainer):
             return loss.detach() / self.args.gradient_accumulation_steps
 
 # compute metrics do not work properly at the moment, because the first n tokens, i.e memory tokens are decoded and taken into account in evaluation.
+def collate_batch(batch):
+    ret = {}
+    for key in batch[0]:
+        if isinstance(batch[0][key], dict):
+            ret[key] = {
+                subk: torch.stack([torch.tensor(item[key][subk]) for item in batch])
+                for subk in batch[0][key]
+            }
+        elif 'text' not in key:
+            ret[key] = torch.stack([torch.tensor(item[key]) for item in batch])
+        else:
+            ret[key] = [item[key] for item in batch]
+    return ret
+
+
 def compute_metrics(eval_pred, model, rouge):
     logits, labels = eval_pred
     if isinstance(logits, tuple):  # Check if logits are wrapped in a tuple
@@ -101,19 +116,38 @@ def get_args():
     args = parser.parse_args()
     return args
 
-def pretrain_tokenize_function(examples,
-                                compressor_tokenizer,
-                                decoder_tokenizer,
-                                tc_ratio=0.0,
-                                compression_rate=1,
-                                max_len=512):
+def pretrain_tokenize_function(
+    examples,
+    compressor_tokenizer,
+    decoder_tokenizer,
+    tc_ratio=0.0,
+    compression_rates=None,
+    max_len=512,
+):
 
-        ae = random.random() >= tc_ratio
-        if ae:
-            training_input = prepare_auto_encoding(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len, train=True)
-        else:
-            training_input  = prepare_text_continuation(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len, train=True)
-        return training_input
+    if compression_rates is None:
+        compression_rates = [1]
+
+    ae = random.random() >= tc_ratio
+    if ae:
+        training_input = prepare_auto_encoding(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
+    else:
+        training_input = prepare_text_continuation(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
+    return training_input
 
 
 
@@ -163,13 +197,20 @@ def main():
     dataset['test'] = dataset['test'].select(range(64))
 
 
-    dataset = dataset.map(pretrain_tokenize_function, num_proc=num_proc, batched=True,
-                                            fn_kwargs={"compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
-                                                        "decoder_tokenizer": model.decoder_tokenizer,
-                                                        "tc_ratio": args.tc_ratio,
-                                                        "max_len": args.doc_max_length,
-                                                        "compression_rate": args.compression_rate}
-                                                        )
+    dataset = dataset.map(
+        pretrain_tokenize_function,
+        num_proc=num_proc,
+        batched=True,
+        fn_kwargs={
+            "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
+            "decoder_tokenizer": model.decoder_tokenizer,
+            "tc_ratio": args.tc_ratio,
+            "max_len": args.doc_max_length,
+            "compression_rates": [args.compression_rate]
+            if isinstance(args.compression_rate, int)
+            else args.compression_rate,
+        },
+    )
 
     dataset['train'] = dataset['train'].shuffle(seed=42)
 
@@ -213,7 +254,8 @@ def main():
         args=training_args,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'],
-        compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge)
+        compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge),
+        data_collator=collate_batch,
     )
 
     trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)

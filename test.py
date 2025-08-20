@@ -25,7 +25,13 @@ def get_args():
 def collate_batch(batch):
     return_dict = {}
     for key in batch[0]:
-        if 'text' not in key:
+        if isinstance(batch[0][key], dict):
+            # handle nested dictionaries for different compression rates
+            return_dict[key] = {
+                subk: torch.stack([torch.tensor(item[key][subk]) for item in batch])
+                for subk in batch[0][key]
+            }
+        elif 'text' not in key:
             return_dict[key] = torch.stack([torch.tensor(item[key]) for item in batch])
         else:
             return_dict[key] = [item[key] for item in batch]
@@ -68,14 +74,18 @@ def main():
             print(f'File {out_file} exists. Skipping')
             continue
         print(f'Testing on {args.num_test_examples} examples.')
-        dataset_task = dataset.map(pretrain_tokenize_function, batched=True, load_from_cache_file=False,
-                                            fn_kwargs={"compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
-                                                        "decoder_tokenizer": model.decoder_tokenizer,
-                                                        "enc_max_len": args.doc_max_length,
-                                                        "compression_rate": model.compr_rate,
-                                                        'train': False,
-                                                        }
-                                                        )
+        dataset_task = dataset.map(
+            pretrain_tokenize_function,
+            batched=True,
+            load_from_cache_file=False,
+            fn_kwargs={
+                "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
+                "decoder_tokenizer": model.decoder_tokenizer,
+                "enc_max_len": args.doc_max_length,
+                "compression_rates": [model.current_rate],
+                "train": False,
+            },
+        )
         
         dataloader = torch.utils.data.DataLoader(dataset_task, args.batch_size, collate_fn=collate_batch)
         model.eval()
@@ -84,6 +94,12 @@ def main():
         for batch in tqdm(dataloader):
             text = batch.pop('text')
             next_text = batch.pop('next_text')
+            if isinstance(batch['dec_input_ids'], dict):
+                key = list(batch['dec_input_ids'].keys())[0]
+                batch['dec_input_ids'] = batch['dec_input_ids'][key]
+                batch['dec_attention_mask'] = batch['dec_attention_mask'][key]
+                if 'labels' in batch:
+                    batch['labels'] = batch['labels'][key]
             pred = model.generate(batch, max_new_tokens=256)
             preds += pred
             next_texts += next_text
