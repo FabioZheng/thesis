@@ -88,21 +88,29 @@ def pretrain_tokenize_function(examples,
                                compressor_tokenizer,
                                decoder_tokenizer,
                                tc_ratio=0.0,
-                               compression_rates=[],  # Now accepts list
+                               compression_rates=[],  # list of compression rates
                                max_len=512):
 
-
     ae = random.random() >= tc_ratio
-    # For multiple compression rates, we'll use the first one for tokenization
-    # since the actual compression happens in the model
-    compression_rate = compression_rates[0] if isinstance(compression_rates, list) else compression_rates
 
     if ae:
-        return prepare_auto_encoding(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len,
-                                     train=True)
+        return prepare_auto_encoding(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
     else:
-        return prepare_text_continuation(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len,
-                                         train=True)
+        return prepare_text_continuation(
+            examples,
+            compressor_tokenizer,
+            decoder_tokenizer,
+            compression_rates,
+            max_len,
+            train=True,
+        )
 
 
 def main():
@@ -189,6 +197,28 @@ def main():
 
     dataset['train'] = dataset['train'].shuffle(seed=42)
 
+    def collate_batch(batch):
+        enc_input_ids = torch.stack([item['enc_input_ids'] for item in batch])
+        enc_attention_mask = torch.stack([item['enc_attention_mask'] for item in batch])
+        collated = {
+            'enc_input_ids': enc_input_ids,
+            'enc_attention_mask': enc_attention_mask,
+            'dec_input_ids': {},
+            'dec_attention_mask': {},
+            'labels': {}
+        }
+        for rate in args.compression_rates:
+            collated['dec_input_ids'][rate] = torch.stack(
+                [item[f'dec_input_ids_{rate}'] for item in batch]
+            )
+            collated['dec_attention_mask'][rate] = torch.stack(
+                [item[f'dec_attention_mask_{rate}'] for item in batch]
+            )
+            collated['labels'][rate] = torch.stack(
+                [item[f'labels_{rate}'] for item in batch]
+            )
+        return collated
+
     training_args = TrainingArguments(
         output_dir=model_output_dir,
         learning_rate=args.lr,
@@ -222,6 +252,7 @@ def main():
         args=training_args,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'],
+        data_collator=collate_batch,
         compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge)
     )
 

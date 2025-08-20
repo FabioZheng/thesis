@@ -105,14 +105,28 @@ def pretrain_tokenize_function(examples,
                                 compressor_tokenizer,
                                 decoder_tokenizer,
                                 tc_ratio=0.0,
-                                compression_rate=1,
+                                compression_rates=1,
                                 max_len=512):
 
         ae = random.random() >= tc_ratio
         if ae:
-            training_input = prepare_auto_encoding(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len, train=True)
+            training_input = prepare_auto_encoding(
+                examples,
+                compressor_tokenizer,
+                decoder_tokenizer,
+                compression_rates,
+                max_len,
+                train=True,
+            )
         else:
-            training_input  = prepare_text_continuation(examples, compressor_tokenizer, decoder_tokenizer, compression_rate, max_len, train=True)
+            training_input = prepare_text_continuation(
+                examples,
+                compressor_tokenizer,
+                decoder_tokenizer,
+                compression_rates,
+                max_len,
+                train=True,
+            )
         return training_input
 
 
@@ -147,7 +161,7 @@ def main():
         generation_top_k=1,
         sep=False,
         compr_model_name=args.compressor_model_name,
-        compr_rate=args.compression_rate,
+        compr_rates=[args.compression_rate],
         compr_linear_type=args.compression_linear_type,
         lora=lora,
     )
@@ -163,23 +177,48 @@ def main():
     dataset['test'] = dataset['test'].select(range(64))
 
 
-    dataset = dataset.map(pretrain_tokenize_function, num_proc=num_proc, batched=True,
-                                            fn_kwargs={"compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
-                                                        "decoder_tokenizer": model.decoder_tokenizer,
-                                                        "tc_ratio": args.tc_ratio,
-                                                        "max_len": args.doc_max_length,
-                                                        "compression_rate": args.compression_rate}
-                                                        )
+    dataset = dataset.map(
+        pretrain_tokenize_function,
+        num_proc=num_proc,
+        batched=True,
+        fn_kwargs={
+            "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
+            "decoder_tokenizer": model.decoder_tokenizer,
+            "tc_ratio": args.tc_ratio,
+            "max_len": args.doc_max_length,
+            "compression_rates": [args.compression_rate],
+        },
+    )
 
     dataset['train'] = dataset['train'].shuffle(seed=42)
 
-
+    def collate_batch(batch):
+        enc_input_ids = torch.stack([item['enc_input_ids'] for item in batch])
+        enc_attention_mask = torch.stack([item['enc_attention_mask'] for item in batch])
+        collated = {
+            'enc_input_ids': enc_input_ids,
+            'enc_attention_mask': enc_attention_mask,
+            'dec_input_ids': {},
+            'dec_attention_mask': {},
+            'labels': {}
+        }
+        # Only a single compression rate is used in this script
+        for rate in [args.compression_rate]:
+            collated['dec_input_ids'][rate] = torch.stack(
+                [item[f'dec_input_ids_{rate}'] for item in batch]
+            )
+            collated['dec_attention_mask'][rate] = torch.stack(
+                [item[f'dec_attention_mask_{rate}'] for item in batch]
+            )
+            collated['labels'][rate] = torch.stack(
+                [item[f'labels_{rate}'] for item in batch]
+            )
+        return collated
 
     # for index, item in enumerate(dataset['train']):
     #     validate_data_item(item)
         # if index > 100:  # Limit to first 100 items for quick checking
         #     break
-
 
     training_args = TrainingArguments(
         output_dir=model_output_dir,
@@ -213,6 +252,7 @@ def main():
         args=training_args,
         train_dataset=dataset['train'],
         eval_dataset=dataset['test'],
+        data_collator=collate_batch,
         compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge)
     )
 
