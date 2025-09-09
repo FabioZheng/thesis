@@ -8,11 +8,12 @@ from rouge import Rouge
 import datasets
 import torch
 from torch.utils.data import DataLoader
-
+import numpy as np
 from modeling_cocom import COCOM
 from cmab_agent import CompressionBanditAgent, batch_entropy
 from metrics import exact_match_score, compute_rouge_scores
 from utils import prepare_auto_encoding
+from bert_score import BERTScorer
 
 
 def collate_batch(batch):
@@ -83,6 +84,11 @@ def get_args():
     parser.add_argument("--output_dir", type=str, default="bandit_ckpt", help="Where to store the trained agent")
     parser.add_argument("--max_new_tokens", type=int, default=128, help="Generation length during evaluation")
     parser.add_argument("--alpha", type=float, default=1.0, help="UCB exploration parameter")
+    parser.add_argument("--r_alpha", type=float, default=1.0, help="α weight for BERTScore_F1")
+    parser.add_argument("--r_beta", type=float, default=1.0, help="β weight for ROUGE-L")
+    parser.add_argument("--r_gamma", type=float, default=0.1, help="γ weight for 1/compression_rate penalty")
+    parser.add_argument("--bertscore_lang", type=str, default="en", help="Language or model for BERTScore")
+    parser.add_argument("--bertscore_rescale", action="store_true", help="Rescale BERTScore with baseline")
     return parser.parse_args()
 
 
@@ -172,64 +178,120 @@ def main():
     # Training data for bandit
     rewards_history = []
     rouge = Rouge()
+    bert_scorer = BERTScorer(
+        lang = args.bertscore_lang,
+        rescale_with_baseline = args.bertscore_rescale
+    )
 
-    print(f"\n🎯 Training bandit agent on {len(dataset)} examples")
+    print(f"\n🎯 Training bandit agent (online UCB) on {len(dataset)} examples")
     print(f"Compression rates: {model.compr_rates}")
 
-    for rate in model.compr_rates:
-        print(f"\n🔵 Testing Compression Rate: {rate}")
+    # DO NOT attach the bandit to the model during training (to avoid double selection inside COCOM)
+    # We will attach it after training for inference-time selection.
+    # model.set_bandit_agent(agent)  # <- keep this commented during training
 
-        # Prepare dataset for this compression rate
-        prepped = dataset.map(
-            prepare_auto_encoding,
-            batched=True,
-            load_from_cache_file=False,
-            fn_kwargs={
-                "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
-                "decoder_tokenizer": model.decoder_tokenizer,
-                "compression_rate": rate,
-                "enc_max_len": args.doc_max_length,
-                "train": False,
-            },
+    # Prepare dataset once (no per-rate remapping)
+    prepped = dataset.map(
+        prepare_auto_encoding,
+        batched=True,
+        load_from_cache_file=False,
+        fn_kwargs={
+            "compressor_tokenizer": model.compr.tokenizer if model.compr else model.decoder_tokenizer,
+            "decoder_tokenizer": model.decoder_tokenizer,
+            # compression_rate is NOT fixed here; we supply the chosen rate per example at runtime
+            "compression_rate": model.current_rate,  # placeholder; the model’s current_rate will be set per-example
+            "enc_max_len": args.doc_max_length,
+            "train": False,
+        },
+    )
+
+    loader = DataLoader(prepped, batch_size=args.batch_size, collate_fn=collate_batch)
+
+    # Track rewards per rate for reporting
+    rate_reward_sum = {r: 0.0 for r in model.compr_rates}
+    rate_reward_cnt = {r: 0 for r in model.compr_rates}
+
+    total_examples = 0
+    for batch_idx, batch in enumerate(loader):
+        texts = batch.pop("text")
+        # Compute contexts (entropy) on CPU tensors expected by batch_entropy
+        entropies = batch_entropy(batch["enc_input_ids"], batch["enc_attention_mask"])
+
+        ent_arr = np.asarray(entropies, dtype=float)
+        ent_min = float(ent_arr.min()) if ent_arr.size else float('nan')
+        ent_max = float(ent_arr.max()) if ent_arr.size else float('nan')
+        ent_mean = float(ent_arr.mean()) if ent_arr.size else float('nan')
+        ent_std = float(ent_arr.std(ddof=0)) if ent_arr.size else float('nan')
+        print(
+            f"Batch {batch_idx + 1}/{len(loader)} | "
+            f"entropy min={ent_min:.4f}, max={ent_max:.4f}, "
+            f"avg={ent_mean:.4f}, std={ent_std:.4f}"
         )
 
-        loader = DataLoader(prepped, batch_size=args.batch_size, collate_fn=collate_batch)
-        model.current_rate = rate
+        B = len(texts)
 
-        batch_rewards = []
-        total_batches = len(loader)
+        # Process each example independently: select → play → update
+        for i in range(B):
+            x = float(entropies[i])  # context feature (entropy); if you use d>1 features, pass a vector
+            # UCB arm selection (uses A_a, b_a, alpha inside the agent)
+            chosen_rate = agent.select_rate(x)
 
-        for idx, batch in enumerate(loader):
-            texts = batch.pop("text")
-            batch = {k: v.to(device) for k, v in batch.items()}
+            # Build a single-example sub-batch
+            ex = {
+                "enc_input_ids": batch["enc_input_ids"][i:i + 1].to(device),
+                "enc_attention_mask": batch["enc_attention_mask"][i:i + 1].to(device),
+                "dec_input_ids": batch["dec_input_ids"][i:i + 1].to(device),
+                "dec_attention_mask": batch["dec_attention_mask"][i:i + 1].to(device),
+            }
+
+            # Force the model to use the chosen rate (no bandit attached during training)
+            model.current_rate = chosen_rate
 
             with torch.no_grad():
-                preds = model.generate(batch, max_new_tokens=args.max_new_tokens)
+                pred = model.generate(ex, max_new_tokens=args.max_new_tokens)[0]
 
-            # Calculate rewards and update bandit
-            entropies = batch_entropy(batch["enc_input_ids"].cpu(), batch["enc_attention_mask"].cpu())
+            gold = texts[i]
 
-            for ent, pred, gold in zip(entropies, preds, texts):
-                # Calculate ROUGE-1 F1 as reward
-                rouge_scores = compute_rouge_scores(rouge, [pred], [gold])
-                reward = rouge_scores['Rouge-1']
+            # Reward = autoencoding fidelity + compression bonus
+            rouge_scores = compute_rouge_scores(rouge, [pred], [gold])
+            rouge_l = rouge_scores['Rouge-L']
+            _, _, f1 = bert_scorer.score([pred], [gold])  # returns tensors
+            bertscore_f1 = float(f1.mean().item())
+            compression_penalty = 1.0 / float(chosen_rate)
+            r = args.r_beta * rouge_l - args.r_gamma * compression_penalty
 
-                # Add compression efficiency bonus
-                compression_bonus = 1.0 / math.sqrt(rate)  # Higher reward for higher compression
-                final_reward = reward + 0.1 * compression_bonus
+            # Online update ONLY the chosen arm with (x, r)
+            agent.update(x, chosen_rate, r)
 
-                # Update bandit
-                agent.update(ent, rate, final_reward)
-                batch_rewards.append(final_reward)
+            # Accounting
+            rate_reward_sum[chosen_rate] += r
+            rate_reward_cnt[chosen_rate] += 1
+            total_examples += 1
 
-            # Progress reporting
-            if (idx + 1) % max(1, total_batches // 10) == 0:
-                recent_reward = sum(batch_rewards[-len(texts):]) / len(texts)
-                print(f"  Batch {idx + 1}/{total_batches}: Recent Reward={recent_reward:.4f}")
+        # Progress log: average reward and selection counts
+        if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
+            filled = {
+                r: (rate_reward_sum[r] / max(1, rate_reward_cnt[r]))
+                for r in model.compr_rates if rate_reward_cnt[r] > 0
+            }
+            avg_recent = np.mean(list(filled.values())) if filled else 0.0
+            print(f"  Batch {batch_idx + 1}/{len(loader)}: avg reward = {avg_recent:.4f}")
 
-        avg_rate_reward = sum(batch_rewards) / len(batch_rewards) if batch_rewards else 0.0
-        rewards_history.append((rate, avg_rate_reward))
-        print(f"✅ Avg Reward for Rate {rate}: {avg_rate_reward:.4f}")
+            # Print selection counts for each rate
+            counts_str = " | ".join([f"rate {r}: {rate_reward_cnt[r]}" for r in model.compr_rates])
+            print(f"    Selections so far → {counts_str}")
+
+
+    # Summarize per-rate averages
+    rewards_history = []
+    for r in model.compr_rates:
+        avg_r = (rate_reward_sum[r] / rate_reward_cnt[r]) if rate_reward_cnt[r] > 0 else 0.0
+        rewards_history.append((r, avg_r))
+        print(f"✅ Avg Reward (played) for Rate {r}: {avg_r:.4f}")
+
+    # Now attach the trained bandit for inference-time selection inside COCOM.generate()
+    model.set_bandit_agent(
+        agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time:contentReference[oaicite:1]{index=1}
 
     # Save trained agent
     os.makedirs(args.output_dir, exist_ok=True)
