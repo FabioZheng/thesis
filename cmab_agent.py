@@ -50,8 +50,9 @@ def batch_perplexity(model, input_ids, attention_mask) -> List[float]:
 
     Parameters
     ----------
-    model : transformers.PreTrainedModel
-        Language model used to compute the likelihood of the documents.
+    model : transformers.PreTrainedModel or COCOM
+        Language model used to compute the likelihood of the documents. If a
+        ``COCOM`` instance is provided, its ``decoder`` will be used.
     input_ids : torch.LongTensor
         Token ids of shape ``(batch_size, seq_len)``.
     attention_mask : torch.LongTensor
@@ -63,14 +64,18 @@ def batch_perplexity(model, input_ids, attention_mask) -> List[float]:
         Perplexity score for every document.
     """
 
-    device = next(model.parameters()).device
+    # ``COCOM`` wraps a decoder model which exposes the standard causal LM
+    # interface.  If present, compute perplexity with the decoder.
+    lm = getattr(model, "decoder", model)
+
+    device = next(lm.parameters()).device
     perplexities = []
-    model.eval()
+    lm.eval()
     with torch.no_grad():
         for ids, mask in zip(input_ids, attention_mask):
             ids = ids.to(device)
             mask = mask.to(device)
-            outputs = model(
+            outputs = lm(
                 input_ids=ids.unsqueeze(0),
                 attention_mask=mask.unsqueeze(0),
                 labels=ids.unsqueeze(0),
