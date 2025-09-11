@@ -1,6 +1,5 @@
 import argparse
 import os
-import math
 import pickle
 import json
 import matplotlib.pyplot as plt
@@ -10,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 from modeling_cocom import COCOM
-from cmab_agent import CompressionBanditAgent, batch_entropy
+from cmab_agent import CompressionBanditAgent, batch_perplexity
 from metrics import exact_match_score, compute_rouge_scores
 from utils import prepare_auto_encoding
 from bert_score import BERTScorer
@@ -214,25 +213,25 @@ def main():
     total_examples = 0
     for batch_idx, batch in enumerate(loader):
         texts = batch.pop("text")
-        # Compute contexts (entropy) on CPU tensors expected by batch_entropy
-        entropies = batch_entropy(batch["enc_input_ids"], batch["enc_attention_mask"])
+        # Compute contexts (perplexity) on CPU tensors expected by batch_perplexity
+        perplexities = batch_perplexity(model, batch["enc_input_ids"], batch["enc_attention_mask"])
 
-        ent_arr = np.asarray(entropies, dtype=float)
-        ent_min = float(ent_arr.min()) if ent_arr.size else float('nan')
-        ent_max = float(ent_arr.max()) if ent_arr.size else float('nan')
-        ent_mean = float(ent_arr.mean()) if ent_arr.size else float('nan')
-        ent_std = float(ent_arr.std(ddof=0)) if ent_arr.size else float('nan')
+        perp_arr = np.asarray(perplexities, dtype=float)
+        perp_min = float(perp_arr.min()) if perp_arr.size else float('nan')
+        perp_max = float(perp_arr.max()) if perp_arr.size else float('nan')
+        perp_mean = float(perp_arr.mean()) if perp_arr.size else float('nan')
+        perp_std = float(perp_arr.std(ddof=0)) if perp_arr.size else float('nan')
         print(
             f"Batch {batch_idx + 1}/{len(loader)} | "
-            f"entropy min={ent_min:.4f}, max={ent_max:.4f}, "
-            f"avg={ent_mean:.4f}, std={ent_std:.4f}"
+            f"perplexity min={perp_min:.4f}, max={perp_max:.4f}, "
+            f"avg={perp_mean:.4f}, std={perp_std:.4f}"
         )
 
         B = len(texts)
 
         # Process each example independently: select → play → update
         for i in range(B):
-            x = float(entropies[i])  # context feature (entropy); if you use d>1 features, pass a vector
+            x = float(perplexities[i])  # context feature (perplexity); if you use d>1 features, pass a vector
             # UCB arm selection (uses A_a, b_a, alpha inside the agent)
             chosen_rate = agent.select_rate(x)
 
@@ -291,7 +290,7 @@ def main():
 
     # Now attach the trained bandit for inference-time selection inside COCOM.generate()
     model.set_bandit_agent(
-        agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time:contentReference[oaicite:1]{index=1}
+        agent)  # COCOM will call agent.select_rate(...) based on perplexity at generation time
 
     # Save trained agent
     os.makedirs(args.output_dir, exist_ok=True)

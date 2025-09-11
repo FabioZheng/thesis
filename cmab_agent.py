@@ -13,21 +13,22 @@ class CompressionBanditAgent:
         self.A = {r: np.identity(1) for r in self.rates}
         self.b = {r: np.zeros((1, 1)) for r in self.rates}
 
-    def _feat(self, entropy: float) -> np.ndarray:
-        return np.array([[entropy]], dtype=float)
+    def _feat(self, perplexity: float) -> np.ndarray:
+        return np.array([[perplexity]], dtype=float)
 
-    def select_rate(self, entropy: float) -> int:
-        x = self._feat(entropy)
+    def select_rate(self, perplexity: float) -> int:
+        x = self._feat(perplexity)
         scores = {}
         for r in self.rates:
             A_inv = np.linalg.inv(self.A[r])
             theta = A_inv @ self.b[r]
+            print(f"Rate {r} theta: {theta.ravel()[0]:.4f}")
             p = float(theta.T @ x + self.alpha * math.sqrt(x.T @ A_inv @ x))
             scores[r] = p
         return max(self.rates, key=lambda r: scores[r])
 
-    def update(self, entropy: float, rate: int, reward: float) -> None:
-        x = self._feat(entropy)
+    def update(self, perplexity: float, rate: int, reward: float) -> None:
+        x = self._feat(perplexity)
         self.A[rate] += x @ x.T
         self.b[rate] += reward * x
 
@@ -69,7 +70,11 @@ def batch_perplexity(model, input_ids, attention_mask) -> List[float]:
         for ids, mask in zip(input_ids, attention_mask):
             ids = ids.to(device)
             mask = mask.to(device)
-            outputs = model(input_ids=ids.unsqueeze(0), attention_mask=mask.unsqueeze(0), labels=ids.unsqueeze(0))
+            outputs = model(
+                input_ids=ids.unsqueeze(0),
+                attention_mask=mask.unsqueeze(0),
+                labels=ids.unsqueeze(0),
+            )
             loss = outputs.loss
             perplexities.append(float(math.exp(loss.item())))
     return perplexities
