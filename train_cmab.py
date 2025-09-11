@@ -211,6 +211,11 @@ def main():
     rate_reward_sum = {r: 0.0 for r in model.compr_rates}
     rate_reward_cnt = {r: 0 for r in model.compr_rates}
 
+    # Collect (entropy, reward) pairs per rate for visualization
+    rate_points = {
+        r: {"entropy": [], "reward": []} for r in model.compr_rates
+    }
+
     total_examples = 0
     for batch_idx, batch in enumerate(loader):
         texts = batch.pop("text")
@@ -268,6 +273,10 @@ def main():
             rate_reward_cnt[chosen_rate] += 1
             total_examples += 1
 
+            # Store points for scatter plot
+            rate_points[chosen_rate]["entropy"].append(x)
+            rate_points[chosen_rate]["reward"].append(r)
+
         # Progress log: average reward and selection counts
         if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
             filled = {
@@ -300,12 +309,27 @@ def main():
         theta = agent.get_theta(r)
         print(f"  Rate {r}: expected_reward ≈ {theta:.4f} * entropy")
 
+    # Visualize entropy vs reward for all documents
+    os.makedirs(args.output_dir, exist_ok=True)
+    plt.figure()
+    for r in model.compr_rates:
+        pts = rate_points[r]
+        if pts["entropy"]:
+            plt.scatter(pts["entropy"], pts["reward"], alpha=0.6, label=f"rate {r}")
+    plt.xlabel("Entropy")
+    plt.ylabel("Reward")
+    plt.title("Document Reward vs Entropy by Compression Rate")
+    plt.legend()
+    plt.tight_layout()
+    plot_path = os.path.join(args.output_dir, "entropy_reward_scatter.png")
+    plt.savefig(plot_path)
+    plt.close()
+
     # Now attach the trained bandit for inference-time selection inside COCOM.generate()
     model.set_bandit_agent(
         agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time:contentReference[oaicite:1]{index=1}
 
     # Save trained agent
-    os.makedirs(args.output_dir, exist_ok=True)
 
     # Save agent state
     agent_data = {
