@@ -281,6 +281,12 @@ def main():
             counts_str = " | ".join([f"rate {r}: {rate_reward_cnt[r]}" for r in model.compr_rates])
             print(f"    Selections so far → {counts_str}")
 
+            relations_str = " | ".join([
+                f"rate {r}: reward ≈ {agent.get_theta(r):.4f} * entropy"
+                for r in model.compr_rates
+            ])
+            print(f"    Learned relations → {relations_str}")
+
 
     # Summarize per-rate averages
     rewards_history = []
@@ -288,6 +294,11 @@ def main():
         avg_r = (rate_reward_sum[r] / rate_reward_cnt[r]) if rate_reward_cnt[r] > 0 else 0.0
         rewards_history.append((r, avg_r))
         print(f"✅ Avg Reward (played) for Rate {r}: {avg_r:.4f}")
+
+    print("\n📐 Learned linear relations (expected reward vs entropy):")
+    for r in model.compr_rates:
+        theta = agent.get_theta(r)
+        print(f"  Rate {r}: expected_reward ≈ {theta:.4f} * entropy")
 
     # Now attach the trained bandit for inference-time selection inside COCOM.generate()
     model.set_bandit_agent(

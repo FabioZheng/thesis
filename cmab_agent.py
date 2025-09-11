@@ -31,6 +31,15 @@ class CompressionBanditAgent:
         self.A[rate] += x @ x.T
         self.b[rate] += reward * x
 
+    def get_theta(self, rate: int) -> float:
+        """Return the learned linear weight for a given arm.
+
+        The expected reward is approximated as ``theta * entropy``.
+        """
+        A_inv = np.linalg.inv(self.A[rate])
+        theta = A_inv @ self.b[rate]
+        return float(theta.squeeze())
+
 
 def batch_entropy(input_ids, attention_mask) -> List[float]:
     entropies = []
