@@ -19,6 +19,7 @@ except Exception as e:
 
 # Viz
 from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
 import plotly.express as px
 
 # Optional Streamlit integration
@@ -205,6 +206,18 @@ class CosineRetriever:
 
 
 # -----------------------------
+# Clustering
+# -----------------------------
+def cluster_embeddings(embeddings: np.ndarray, k: int) -> np.ndarray:
+    """Cluster embeddings into ``k`` groups using KMeans."""
+    if k <= 0:
+        raise ValueError("k must be positive")
+    model = KMeans(n_clusters=int(k), random_state=42)
+    labels = model.fit_predict(embeddings)
+    return labels
+
+
+# -----------------------------
 # Visualization
 # -----------------------------
 def plot_embeddings_pca(
@@ -346,3 +359,35 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
                 st.markdown(f"**{rank}. {doc_id}** — cos={score:.4f}")
                 st.write(text[:600] + ("..." if len(text) > 600 else ""))
                 st.markdown("---")
+
+
+def render_clustering_block():
+    """Streamlit block to cluster built embeddings and visualize the groups."""
+    if st is None:
+        raise RuntimeError("Streamlit not available. Install streamlit to use this UI helper.")
+
+    required_keys = {"__embeddings", "__doc_ids", "__store"}
+    if not required_keys.issubset(st.session_state):
+        st.info("Build embeddings first to run clustering.")
+        return
+
+    st.subheader("🔗 Clustering")
+    k = st.number_input("Number of clusters (k)", min_value=2, max_value=50, value=5)
+    if st.button("Cluster embeddings"):
+        labels = cluster_embeddings(st.session_state["__embeddings"], int(k))
+        st.session_state["__cluster_labels"] = labels
+        st.success(f"Computed {int(k)} clusters")
+
+    if "__cluster_labels" in st.session_state:
+        labels = st.session_state["__cluster_labels"]
+        embeddings = st.session_state["__embeddings"]
+        doc_ids = st.session_state["__doc_ids"]
+        fig = plot_embeddings_pca(embeddings, doc_ids, sample=1000)
+        id_to_label = {d: l for d, l in zip(doc_ids, labels)}
+        points = getattr(fig.data[0], "hovertext", [])
+        colors = [id_to_label.get(d, -1) for d in points]
+        fig.data[0].marker.color = colors
+        st.plotly_chart(fig, use_container_width=True)
+
+        counts = pd.Series(labels).value_counts().sort_index()
+        st.write(pd.DataFrame({"cluster": counts.index, "count": counts.values}))

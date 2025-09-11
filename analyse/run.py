@@ -603,8 +603,9 @@ def main():
 
         # Retrieval sandbox (embedding UI)
         st.header("🧭 Retrieval Sandbox")
-        from retrieval import render_embeddings_block
+        from retrieval import render_embeddings_block, render_clustering_block
         render_embeddings_block(analyzer.dataset, candidate_text_cols=analyzer.text_columns)
+        render_clustering_block()
 
 
 if __name__ == "__main__":
