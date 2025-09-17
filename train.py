@@ -189,40 +189,43 @@ def main():
         dataset = datasets.load_from_disk(args.dataset_name_or_dir)
     else:
         dataset = datasets.load_dataset(args.dataset_name_or_dir)
-    '''
-    dataset_stream = datasets.load_dataset("openwebtext", split="train", streaming=True)
 
+    if args.dataset_name_or_dir == "openwebtext":
 
-    def split_text_row(example):
-        """
-        Split the 'text' field into two halves:
-        - First half → 'text'
-        - Second half → 'next_text'
-        """
-        original_text = example["text"]
-        midpoint = len(original_text) // 2
-        return {
-            "text": original_text[:midpoint],
-            "next_text": original_text[midpoint:]
-        }
+        dataset = datasets.load_dataset("openwebtext", split="train")
 
-    # Take subsets from the stream
-    train_stream = islice(dataset_stream, 3000)
-    test_stream = islice(dataset_stream, 32)
+        def split_text_row(example):
+            """
+            Split the 'text' field into two halves:
+            - First half → 'text'
+            - Second half → 'next_text'
+            """
+            original_text = example["text"]
+            midpoint = len(original_text) // 2
+            return {
+                "text": original_text[:midpoint],
+                "next_text": original_text[midpoint:]
+            }
 
-    # Materialize and split text fields
-    train_data = [split_text_row(row) for row in train_stream]
-    test_data = [split_text_row(row) for row in test_stream]
+        # Take fixed subsets from the dataset
+        train_size = 8000000
+        test_size = 32
 
-    # Turn into DatasetDict
-    dataset = datasets.DatasetDict({
-        'train': datasets.Dataset.from_list(train_data),
-        'test': datasets.Dataset.from_list(test_data)
-    })
-    '''
+        # Select and split the data
+        train_data = [split_text_row(row) for row in dataset.select(range(train_size))]
+        test_data = [split_text_row(row) for row in dataset.select(range(train_size, train_size + test_size))]
 
-    dataset['train'] = dataset['train'].select(range(min(10000, len(dataset['train']))))
-    dataset['test'] = dataset['test'].select(range(min(32, len(dataset['test']))))
+        # Turn into DatasetDict
+        dataset = datasets.DatasetDict({
+            'train': datasets.Dataset.from_list(train_data),
+            'test': datasets.Dataset.from_list(test_data)
+        })
+    else:
+
+        dataset['train'] = dataset['train'].select(range(len(dataset['train'])))
+        dataset['test'] = dataset['test'].select(range(min(32, len(dataset['test']))))
+    
+
 
     cfg = COCOMConfig(
         decoder_model_name=args.decoder_model_name,
