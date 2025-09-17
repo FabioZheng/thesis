@@ -9,6 +9,7 @@ import datasets
 import torch
 from torch.utils.data import DataLoader
 import numpy as np
+import wandb
 from modeling_cocom import COCOM
 from cmab_agent import CompressionBanditAgent, batch_entropy
 from metrics import exact_match_score, compute_rouge_scores
@@ -142,6 +143,7 @@ def prepare_dataset(dataset, dataset_name):
 
 def main():
     args = get_args()
+    wandb.init(project="COCOM CMAB", config=vars(args))
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load model with enhanced error handling
@@ -281,6 +283,12 @@ def main():
             counts_str = " | ".join([f"rate {r}: {rate_reward_cnt[r]}" for r in model.compr_rates])
             print(f"    Selections so far → {counts_str}")
 
+            # Log metrics to Weights & Biases
+            log_data = {"avg_reward": avg_recent}
+            for r in model.compr_rates:
+                log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
+            wandb.log(log_data)
+
 
     # Summarize per-rate averages
     rewards_history = []
@@ -337,6 +345,7 @@ def main():
 
     print(f"\n✅ Bandit training completed!")
     print(f"📁 Agent saved to: {args.output_dir}/bandit_agent.pkl")
+    wandb.finish()
 
 
 if __name__ == "__main__":
