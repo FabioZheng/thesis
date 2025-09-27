@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+import pickle
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -9,7 +10,7 @@ import torch
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
-from cmab_agent import batch_entropy
+from cmab_agent import CompressionBanditAgent, batch_entropy
 
 
 def parse_args() -> argparse.Namespace:
@@ -25,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("docs_out", help="Directory to save flattened documents")
     parser.add_argument("contexts_out", help="Directory to save compressed contexts")
     parser.add_argument("embeddings_out", help="Directory to save document embeddings")
+    parser.add_argument(
+        "--bandit-agent",
+        default=None,
+        help="Path to the trained bandit agent pickle (e.g., bandit_ckpt/bandit_agent.pkl)",
+    )
     parser.add_argument(
         "--embedder-model",
         default="sentence-transformers/all-MiniLM-L6-v2",
@@ -78,6 +84,23 @@ def save_json(data: Dict, directory: str, filename: str) -> str:
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
     return path
+
+
+def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
+    with open(path, "rb") as f:
+        agent_data = pickle.load(f)
+
+    agent_rates = agent_data.get("rates", rates)
+    agent_alpha = agent_data.get("alpha", 1.0)
+    agent = CompressionBanditAgent(agent_rates, alpha=agent_alpha)
+
+    # Restore learned parameters if available
+    if "A" in agent_data:
+        agent.A = agent_data["A"]
+    if "b" in agent_data:
+        agent.b = agent_data["b"]
+
+    return agent
 
 
 def generate_contexts(
@@ -160,6 +183,20 @@ def main() -> None:
     model = load_model_safely(args.checkpoint)
     model.to(device)
     model.eval()
+
+    if args.bandit_agent:
+        bandit_path = args.bandit_agent
+        if os.path.isdir(bandit_path):
+            bandit_path = os.path.join(bandit_path, "bandit_agent.pkl")
+        if not os.path.exists(bandit_path):
+            raise FileNotFoundError(
+                f"Bandit agent not found at {bandit_path}. Provide a valid path to bandit_agent.pkl"
+            )
+        agent = load_bandit_agent(bandit_path, getattr(model, "compr_rates", []))
+        model.set_bandit_agent(agent)
+        print(f"Loaded bandit agent from {bandit_path}")
+    else:
+        print("No bandit agent provided; defaulting to fallback compression rate")
 
     contexts = generate_contexts(docs, model, args.compression_rate)
     contexts_path = save_json(contexts, args.contexts_out, "contexts.json")
