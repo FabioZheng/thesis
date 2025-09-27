@@ -26,8 +26,8 @@ def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
     doc_id = 0
     for _, row in df.iterrows():
         query_id = row.get("query_id")
-        passages = row.get("passages", {}).get("passages", [])
-        for passage in passages:
+        passage_texts = row.get("passages", {}).get("passage_text", [])
+        for passage in passage_texts:
             docs[doc_id] = {"query_id": query_id, "text": passage}
             doc_id += 1
     return docs
