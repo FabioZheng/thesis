@@ -178,7 +178,7 @@ class CorpusEncoder:
 class CosineRetriever:
     embeddings: np.ndarray  # (N, D), L2-normalized if using cosine via dot
     doc_ids: List[str]
-    store: Dict[str, Dict[str, Any]]
+    store: Optional[Dict[str, Dict[str, Any]]] = None
 
     def __post_init__(self):
         if self.embeddings.dtype != np.float32:
@@ -192,17 +192,44 @@ class CosineRetriever:
         """
         # dot product with normalized embeddings = cosine
         sims = self.embeddings @ q.astype(np.float32)
-        topk_idx = np.argpartition(-sims, kth=min(k, len(sims)-1))[:k]
+        if sims.size == 0:
+            return []
+
+        k = max(1, min(int(k), sims.size))
+        topk_idx = np.argpartition(-sims, kth=k - 1)[:k]
         topk_idx = topk_idx[np.argsort(-sims[topk_idx])]
         return [(self.doc_ids[i], float(sims[i])) for i in topk_idx]
 
     def search(
-        self, query: str, query_embedder: TextEmbedder, k: int = 5
-    ) -> List[Tuple[str, float, str]]:
+        self,
+        query: str,
+        query_embedder: TextEmbedder,
+        k: int = 5,
+        include_text: bool = True,
+    ) -> Dict[str, Any]:
+        """Return a dict containing retrieval ``results`` and ``doc_ids``.
+
+        Each entry in ``results`` has ``doc_id`` and ``score`` keys and
+        optionally ``text`` when ``include_text`` is True and the store
+        provides it. ``doc_ids`` is a convenience list of the ranked
+        document identifiers for downstream lookups (e.g., context
+        embeddings stored separately on disk).
+        """
         q_emb = query_embedder.encode([query])[0].astype(np.float32)
         hits = self._cosine_topk(q_emb, k=k)
-        # attach text
-        return [(doc_id, score, self.store[doc_id]["text"]) for doc_id, score in hits]
+        results: List[Dict[str, Any]] = []
+        for doc_id, score in hits:
+            entry: Dict[str, Any] = {"doc_id": doc_id, "score": score}
+            if include_text and self.store:
+                text = self.store.get(doc_id, {}).get("text")
+                if text is not None:
+                    entry["text"] = text
+            results.append(entry)
+
+        return {
+            "results": results,
+            "doc_ids": [r["doc_id"] for r in results],
+        }
 
 
 # -----------------------------
@@ -353,11 +380,19 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
                     doc_ids=st.session_state["__doc_ids"],
                     store=st.session_state["__store"],
                 )
-                hits = retriever.search(q, q_embedder, k=int(k))
+                search_output = retriever.search(q, q_embedder, k=int(k))
 
-            for rank, (doc_id, score, text) in enumerate(hits, 1):
+            hits = search_output["results"]
+            st.session_state["__last_query_doc_ids"] = search_output["doc_ids"]
+
+            for rank, hit in enumerate(hits, 1):
+                doc_id = hit["doc_id"]
+                score = hit["score"]
+                text = hit.get("text", "")
                 st.markdown(f"**{rank}. {doc_id}** — cos={score:.4f}")
-                st.write(text[:600] + ("..." if len(text) > 600 else ""))
+                if text:
+                    display_text = text[:600] + ("..." if len(text) > 600 else "")
+                    st.write(display_text)
                 st.markdown("---")
 
 
