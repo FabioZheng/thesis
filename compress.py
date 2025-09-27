@@ -9,6 +9,7 @@ import torch
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
+from cmab_agent import batch_entropy
 
 
 def parse_args() -> argparse.Namespace:
@@ -80,7 +81,7 @@ def save_json(data: Dict, directory: str, filename: str) -> str:
 
 
 def generate_contexts(
-    docs: Dict[int, Dict[str, str]], model: COCOM, rate: int
+    docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
 ) -> Dict[int, Dict[str, Any]]:
     try:
         device = next(model.parameters()).device
@@ -88,6 +89,7 @@ def generate_contexts(
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     contexts: Dict[int, Dict[str, Any]] = {}
+    agent = getattr(model, "bandit_agent", None)
     for doc_id, item in docs.items():
         tokens = model.compr.tokenizer(
             item["text"],
@@ -95,17 +97,28 @@ def generate_contexts(
             truncation=True,
             max_length=512,
         )
+        selected_rate = fallback_rate
+        entropy: Optional[float] = None
+        if agent is not None:
+            entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
+            try:
+                selected_rate = agent.select_rate(float(entropy))
+            except Exception:
+                selected_rate = fallback_rate
         tokens = {k: v.to(device) for k, v in tokens.items()}
         with torch.no_grad():
             emb = model.compr(
                 input_ids=tokens["input_ids"],
                 attention_mask=tokens["attention_mask"],
-                rate=rate,
+                rate=selected_rate,
             )
         contexts[doc_id] = {
             "query_id": item["query_id"],
             "context": emb.cpu().tolist(),
+            "compression_rate": selected_rate,
         }
+        if entropy is not None:
+            contexts[doc_id]["entropy"] = entropy
     return contexts
 
 
