@@ -6,8 +6,9 @@ from typing import Any, Dict, List, Optional
 import pandas as pd
 import torch
 
-from modeling_cocom import COCOM
 from analyse.retrieval import TextEmbedder
+from modeling_cocom import COCOM
+from train_cmab import load_model_safely
 
 
 def parse_args() -> argparse.Namespace:
@@ -15,7 +16,10 @@ def parse_args() -> argparse.Namespace:
         description="Generate compressed contexts and embeddings for MS MARCO passages"
     )
     parser.add_argument("dataset", help="Path to MS MARCO dataset file (JSON/JSONL)")
-    parser.add_argument("model_name", help="Pretrained COCOM model name or path")
+    parser.add_argument(
+        "checkpoint",
+        help="Path to a trained COCOM checkpoint directory for context generation",
+    )
     parser.add_argument("compression_rate", type=int, help="Compression rate")
     parser.add_argument("docs_out", help="Directory to save flattened documents")
     parser.add_argument("contexts_out", help="Directory to save compressed contexts")
@@ -51,9 +55,18 @@ def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
     doc_id = 0
     for _, row in df.iterrows():
         query_id = row.get("query_id")
-        passage_texts = row.get("passages", {}).get("passage_text", [])
+        passages_field = row.get("passages", {})
+        passage_texts: List[str] = []
+        if isinstance(passages_field, dict):
+            if "passages" in passages_field:
+                passage_texts = passages_field.get("passages", [])
+            else:
+                passage_texts = passages_field.get("passage_text", [])
         for passage in passage_texts:
-            docs[doc_id] = {"query_id": query_id, "text": passage}
+            if passage is None:
+                continue
+            text = passage if isinstance(passage, str) else str(passage)
+            docs[doc_id] = {"query_id": query_id, "text": text}
             doc_id += 1
     return docs
 
@@ -67,12 +80,12 @@ def save_json(data: Dict, directory: str, filename: str) -> str:
 
 
 def generate_contexts(
-    docs: Dict[int, Dict[str, str]], model_name: str, rate: int
+    docs: Dict[int, Dict[str, str]], model: COCOM, rate: int
 ) -> Dict[int, Dict[str, Any]]:
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = COCOM.from_pretrained(model_name)
-    model.to(device)
-    model.eval()
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     contexts: Dict[int, Dict[str, Any]] = {}
     for doc_id, item in docs.items():
@@ -130,10 +143,15 @@ def main() -> None:
     docs_path = save_json(docs, args.docs_out, "docs.json")
     print(f"Extracted {len(docs)} MS MARCO passages -> {docs_path}")
 
-    contexts = generate_contexts(docs, args.model_name, args.compression_rate)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model_safely(args.checkpoint)
+    model.to(device)
+    model.eval()
+
+    contexts = generate_contexts(docs, model, args.compression_rate)
     contexts_path = save_json(contexts, args.contexts_out, "contexts.json")
     print(
-        f"Generated contexts for {len(contexts)} MS MARCO passages -> {contexts_path}"
+        f"Generated contexts for {len(contexts)} MS MARCO passages using checkpoint {args.checkpoint} -> {contexts_path}"
     )
 
     embeddings = generate_embeddings(
