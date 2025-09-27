@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import pickle
+import sys
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -78,12 +79,45 @@ def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
     return docs
 
 
-def save_json(data: Dict, directory: str, filename: str) -> str:
+def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
+    base_size = sys.getsizeof(obj)
+
+    if isinstance(obj, dict):
+        items = list(obj.items())
+    elif isinstance(obj, list):
+        items = list(enumerate(obj))
+    else:
+        items = []
+
+    sample_size = min(len(items), 100)
+    sampled_bytes = 0
+    for key, value in items[:sample_size]:
+        sampled_bytes += sys.getsizeof(key)
+        sampled_bytes += sys.getsizeof(value)
+
+    multiplier = (len(items) / sample_size) if sample_size else 1
+    approx_bytes = base_size + sampled_bytes * multiplier
+
+    try:
+        serialized = pickle.dumps(obj)
+        pickle_bytes = len(serialized)
+    except Exception:
+        pickle_bytes = 0
+
+    return {
+        "approx_memory_mb": approx_bytes / (1024 * 1024),
+        "pickle_disk_mb": pickle_bytes / (1024 * 1024),
+    }
+
+
+def save_json(data: Dict, directory: str, filename: str) -> tuple[str, Dict[str, float]]:
     os.makedirs(directory, exist_ok=True)
     path = os.path.join(directory, filename)
+    mem_stats = _estimate_memory_usage(data)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False)
-    return path
+    mem_stats["json_disk_mb"] = os.path.getsize(path) / (1024 * 1024)
+    return path, mem_stats
 
 
 def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
@@ -176,8 +210,17 @@ def main() -> None:
     args = parse_args()
 
     docs = load_and_flatten(args.dataset)
-    docs_path = save_json(docs, args.docs_out, "docs.json")
-    print(f"Extracted {len(docs)} MS MARCO passages -> {docs_path}")
+    docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
+    print(
+        "Extracted {count} MS MARCO passages -> {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=len(docs),
+            path=docs_path,
+            mem=docs_mem.get("approx_memory_mb", 0.0),
+            pickle=docs_mem.get("pickle_disk_mb", 0.0),
+            json=docs_mem.get("json_disk_mb", 0.0),
+        )
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = load_model_safely(args.checkpoint)
@@ -199,9 +242,17 @@ def main() -> None:
         print("No bandit agent provided; defaulting to fallback compression rate")
 
     contexts = generate_contexts(docs, model, args.compression_rate)
-    contexts_path = save_json(contexts, args.contexts_out, "contexts.json")
+    contexts_path, ctx_mem = save_json(contexts, args.contexts_out, "contexts.json")
     print(
-        f"Generated contexts for {len(contexts)} MS MARCO passages using checkpoint {args.checkpoint} -> {contexts_path}"
+        "Generated contexts for {count} MS MARCO passages using checkpoint {ckpt} -> {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=len(contexts),
+            ckpt=args.checkpoint,
+            path=contexts_path,
+            mem=ctx_mem.get("approx_memory_mb", 0.0),
+            pickle=ctx_mem.get("pickle_disk_mb", 0.0),
+            json=ctx_mem.get("json_disk_mb", 0.0),
+        )
     )
 
     embeddings = generate_embeddings(
@@ -211,9 +262,16 @@ def main() -> None:
         args.embedder_device,
         not args.no_embedder_normalize,
     )
-    emb_path = save_json(embeddings, args.embeddings_out, "embeddings.json")
+    emb_path, emb_mem = save_json(embeddings, args.embeddings_out, "embeddings.json")
     print(
-        f"Generated embeddings for {len(embeddings)} MS MARCO passages -> {emb_path}"
+        "Generated embeddings for {count} MS MARCO passages -> {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=len(embeddings),
+            path=emb_path,
+            mem=emb_mem.get("approx_memory_mb", 0.0),
+            pickle=emb_mem.get("pickle_disk_mb", 0.0),
+            json=emb_mem.get("json_disk_mb", 0.0),
+        )
     )
 
 
