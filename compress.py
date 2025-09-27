@@ -1,18 +1,17 @@
 import argparse
 import json
 import os
-from typing import Dict
+from typing import Any, Dict
 
 import pandas as pd
 import torch
 
-from analyse.run import DatasetAnalyzer
-from modeling_cocom import COCOM, COCOMConfig
+from modeling_cocom import COCOM
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate compressed embeddings using COCOM")
-    parser.add_argument("dataset", help="Path to dataset file (CSV/JSON/JSONL/XLSX)")
+    parser.add_argument("dataset", help="Path to MS MARCO dataset file (JSON/JSONL)")
     parser.add_argument("model_name", help="Pretrained COCOM model name or path")
     parser.add_argument("compression_rate", type=int, help="Compression rate")
     parser.add_argument("docs_out", help="Directory to save flattened documents")
@@ -20,21 +19,17 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_and_flatten(dataset_path: str) -> Dict[int, str]:
-    analyzer = DatasetAnalyzer()
-    df = analyzer.load_custom_dataset(dataset_path)
-    if df is None:
-        raise ValueError(f"Failed to load dataset at {dataset_path}")
+def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
+    df = pd.read_json(dataset_path, lines=True)
 
-    docs: Dict[int, str] = {}
-    for doc_id, (_, row) in enumerate(df.iterrows()):
-        texts = []
-        for col in analyzer.text_columns:
-            val = row.get(col)
-            if pd.isna(val):
-                continue
-            texts.append(analyzer._coerce_nested_text(val))
-        docs[doc_id] = " ".join(texts).strip()
+    docs: Dict[int, Dict[str, str]] = {}
+    doc_id = 0
+    for _, row in df.iterrows():
+        query_id = row.get("query_id")
+        passages = row.get("passages", {}).get("passages", [])
+        for passage in passages:
+            docs[doc_id] = {"query_id": query_id, "text": passage}
+            doc_id += 1
     return docs
 
 
@@ -46,16 +41,18 @@ def save_json(data: Dict, directory: str, filename: str) -> str:
     return path
 
 
-def generate_embeddings(docs: Dict[int, str], model_name: str, rate: int) -> Dict[int, list]:
+def generate_embeddings(
+    docs: Dict[int, Dict[str, str]], model_name: str, rate: int
+) -> Dict[int, Dict[str, Any]]:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = COCOM.from_pretrained(model_name)
     model.to(device)
     model.eval()
 
-    embeddings: Dict[int, list] = {}
-    for doc_id, text in docs.items():
+    embeddings: Dict[int, Dict[str, Any]] = {}
+    for doc_id, item in docs.items():
         tokens = model.compr.tokenizer(
-            text,
+            item["text"],
             return_tensors="pt",
             truncation=True,
             max_length=512,
@@ -67,7 +64,10 @@ def generate_embeddings(docs: Dict[int, str], model_name: str, rate: int) -> Dic
                 attention_mask=tokens["attention_mask"],
                 rate=rate,
             )
-        embeddings[doc_id] = emb.cpu().tolist()
+        embeddings[doc_id] = {
+            "query_id": item["query_id"],
+            "embedding": emb.cpu().tolist(),
+        }
     return embeddings
 
 
@@ -76,11 +76,13 @@ def main() -> None:
 
     docs = load_and_flatten(args.dataset)
     docs_path = save_json(docs, args.docs_out, "docs.json")
-    print(f"Extracted {len(docs)} documents -> {docs_path}")
+    print(f"Extracted {len(docs)} MS MARCO passages -> {docs_path}")
 
     embeddings = generate_embeddings(docs, args.model_name, args.compression_rate)
     emb_path = save_json(embeddings, args.embeddings_out, "embeddings.json")
-    print(f"Generated embeddings for {len(embeddings)} documents -> {emb_path}")
+    print(
+        f"Generated embeddings for {len(embeddings)} MS MARCO passages -> {emb_path}"
+    )
 
 
 if __name__ == "__main__":
