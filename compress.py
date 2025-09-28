@@ -25,7 +25,15 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         help="Path to a trained COCOM checkpoint directory for context generation",
     )
-    parser.add_argument("--compression_rate", type=int, help="Fallback rate", default=4)
+    parser.add_argument(
+        "--compression_rate", type=int, help="Fallback rate", default=4
+    )
+    parser.add_argument(
+        "--compression-batch-size",
+        type=int,
+        default=8,
+        help="Number of documents processed concurrently when generating contexts",
+    )
     parser.add_argument("--docs_out", help="Directory to save flattened documents", default="data")
     parser.add_argument("--contexts_out", help="Directory to save compressed contexts", default="data/contexts")
     parser.add_argument("--embeddings_out", help="Directory to save document embeddings", default="data/embeddings")
@@ -143,7 +151,10 @@ from tqdm import tqdm
 
 
 def generate_contexts(
-        docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
+    docs: Dict[int, Dict[str, str]],
+    model: COCOM,
+    fallback_rate: int,
+    batch_size: int = 8,
 ) -> Dict[int, Dict[str, Any]]:
     try:
         device = next(model.parameters()).device
@@ -153,52 +164,89 @@ def generate_contexts(
     contexts: Dict[int, Dict[str, Any]] = {}
     agent = getattr(model, "bandit_agent", None)
 
-    # Add progress bar
-    pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
 
-    for doc_id, item in pbar:
-        tokens = model.compr.tokenizer(
-            item["text"],
+    doc_items = list(docs.items())
+    pad_token_id = model.compr.tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = (
+            model.compr.tokenizer.eos_token_id
+            if model.compr.tokenizer.eos_token_id is not None
+            else 0
+        )
+
+    pbar = tqdm(total=len(doc_items), desc="Generating contexts")
+
+    for start in range(0, len(doc_items), batch_size):
+        batch = doc_items[start : start + batch_size]
+        texts = [item["text"] for _, item in batch]
+
+        token_batch_encoding = model.compr.tokenizer(
+            texts,
             return_tensors="pt",
             truncation=True,
             max_length=512,
-            padding="max_length",  # Add padding to fix size issues
+            padding="max_length",
         )
-        selected_rate = fallback_rate
-        entropy: Optional[float] = None
+        token_batch = {k: v for k, v in token_batch_encoding.items()}
+
+        entropies: List[Optional[float]] = [None] * len(batch)
         if agent is not None:
-            entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
             try:
-                selected_rate = agent.select_rate(float(entropy))
+                entropy_values = batch_entropy(
+                    token_batch["input_ids"], token_batch["attention_mask"]
+                )
+                entropies = [float(ent) for ent in entropy_values]
             except Exception:
-                selected_rate = fallback_rate
+                entropies = [None] * len(batch)
 
-        pad_token_id = model.compr.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = (
-                model.compr.tokenizer.eos_token_id
-                if model.compr.tokenizer.eos_token_id is not None
-                else 0
-            )
-        tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
-        tokens = {k: v.to(device) for k, v in tokens.items()}
+        selected_rates: List[int] = []
+        for entropy in entropies:
+            rate = fallback_rate
+            if agent is not None and entropy is not None:
+                try:
+                    rate = agent.select_rate(entropy)
+                except Exception:
+                    rate = fallback_rate
+            selected_rates.append(rate)
 
-        with torch.no_grad():
-            emb = model.compr(
-                input_ids=tokens["input_ids"],
-                attention_mask=tokens["attention_mask"],
-                rate=selected_rate,
-            )
-        contexts[doc_id] = {
-            "query_id": item["query_id"],
-            "context": emb.cpu().tolist(),
-            "compression_rate": selected_rate,
-        }
-        if entropy is not None:
-            contexts[doc_id]["entropy"] = entropy
+        rate_to_indices: Dict[int, List[int]] = {}
+        for idx, rate in enumerate(selected_rates):
+            rate_to_indices.setdefault(rate, []).append(idx)
 
-        # Update progress description
-        pbar.set_postfix({"rate": selected_rate, "entropy": entropy})
+        for rate, indices in rate_to_indices.items():
+            rate_tokens = {k: v[indices] for k, v in token_batch.items()}
+            rate_tokens = pad_tokens_to_rate(rate_tokens, rate, pad_token_id)
+            rate_tokens = {k: v.to(device) for k, v in rate_tokens.items()}
+
+            with torch.no_grad():
+                emb = model.compr(
+                    input_ids=rate_tokens["input_ids"],
+                    attention_mask=rate_tokens["attention_mask"],
+                    rate=rate,
+                )
+
+            for output_idx, batch_idx in enumerate(indices):
+                doc_id, item = batch[batch_idx]
+                contexts[doc_id] = {
+                    "query_id": item["query_id"],
+                    "context": emb[output_idx].cpu().tolist(),
+                    "compression_rate": rate,
+                }
+                entropy = entropies[batch_idx]
+                if entropy is not None:
+                    contexts[doc_id]["entropy"] = entropy
+
+        if entropies:
+            last_entropy = next((ent for ent in reversed(entropies) if ent is not None), None)
+        else:
+            last_entropy = None
+        pbar.update(len(batch))
+        if selected_rates:
+            pbar.set_postfix({"rate": selected_rates[-1], "entropy": last_entropy})
+
+    pbar.close()
 
     return contexts
 
@@ -266,7 +314,9 @@ def main() -> None:
     else:
         print("No bandit agent provided; defaulting to fallback compression rate")
 
-    contexts = generate_contexts(docs, model, args.compression_rate)
+    contexts = generate_contexts(
+        docs, model, args.compression_rate, batch_size=args.compression_batch_size
+    )
     contexts_path, ctx_mem = save_json(contexts, args.contexts_out, "contexts.json")
     print(
         "Generated contexts for {count} MS MARCO passages using checkpoint {ckpt} -> {path} "
