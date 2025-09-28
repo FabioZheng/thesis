@@ -11,7 +11,8 @@ from torch.utils.data import DataLoader
 import numpy as np
 import wandb
 from modeling_cocom import COCOM
-from cmab_agent import CompressionBanditAgent, batch_entropy
+from cmab_agent import CompressionBanditAgent
+from metrics import batch_entropy
 from metrics import exact_match_score, compute_rouge_scores
 from utils import prepare_auto_encoding
 from bert_score import BERTScorer
