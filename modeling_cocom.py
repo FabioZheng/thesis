@@ -4,7 +4,7 @@ import torch
 import math
 from peft import get_peft_model, LoraConfig, TaskType
 import os
-from cmab_agent import batch_entropy
+from metrics import batch_entropy
 
 
 def freeze_model(model):

@@ -11,7 +11,8 @@ import torch
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
-from cmab_agent import CompressionBanditAgent, batch_entropy
+from cmab_agent import CompressionBanditAgent
+from metrics import batch_entropy
 from utils import pad_tokens_to_rate
 
 

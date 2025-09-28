@@ -5,6 +5,8 @@ import string
 from typing import List
 from rouge import Rouge
 import evaluate
+import math
+from collections import Counter
 
 
 def normalize(s: str) -> str:
@@ -69,6 +71,17 @@ def reward(predictions: List[str], references: List[str], compression_rate: int,
     rouge_l = compute_rouge_scores(rouge, predictions, references)["Rouge-L"]
     compression_penalty = 1.0 / float(compression_rate)
     return alpha * bert_f1 + beta * rouge_l - gamma * compression_penalty
+
+def batch_entropy(input_ids, attention_mask) -> List[float]:
+    entropies = []
+    for ids, mask in zip(input_ids, attention_mask):
+        tokens = ids[mask.bool()].tolist()
+        total = len(tokens)
+        counts = Counter(tokens)
+        probs = [c / total for c in counts.values() if c > 0]
+        ent = -sum(p * math.log(p, 2) for p in probs)
+        entropies.append(ent)
+    return entropies
 
 
 

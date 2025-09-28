@@ -32,18 +32,6 @@ class CompressionBanditAgent:
         self.b[rate] += reward * x
 
 
-def batch_entropy(input_ids, attention_mask) -> List[float]:
-    entropies = []
-    for ids, mask in zip(input_ids, attention_mask):
-        tokens = ids[mask.bool()].tolist()
-        total = len(tokens)
-        counts = Counter(tokens)
-        probs = [c / total for c in counts.values() if c > 0]
-        ent = -sum(p * math.log(p, 2) for p in probs)
-        entropies.append(ent)
-    return entropies
-
-
 def batch_perplexity(model, input_ids, attention_mask) -> List[float]:
     """Compute the perplexity of each document in a batch.
 
