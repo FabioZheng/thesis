@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import torch
+from tqdm import tqdm
 
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
@@ -58,12 +59,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
+def load_and_flatten(
+    dataset_path: str, tokenizer: Optional[Any] = None
+) -> Dict[int, Dict[str, Any]]:
     df = pd.read_json(dataset_path, lines=True)
 
-    docs: Dict[int, Dict[str, str]] = {}
+    docs: Dict[int, Dict[str, Any]] = {}
     doc_id = 0
-    for _, row in df.iterrows():
+    for _, row in tqdm(
+        df.iterrows(), total=len(df), desc="Flattening documents", leave=False
+    ):
         query_id = row.get("query_id")
         passages_field = row.get("passages", {})
         passage_texts: List[str] = []
@@ -72,11 +77,30 @@ def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
                 passage_texts = passages_field.get("passages", [])
             else:
                 passage_texts = passages_field.get("passage_text", [])
-        for passage in passage_texts:
+        for passage in tqdm(
+            passage_texts,
+            desc="Processing passages",
+            leave=False,
+            total=len(passage_texts),
+        ):
             if passage is None:
                 continue
             text = passage if isinstance(passage, str) else str(passage)
-            docs[doc_id] = {"query_id": query_id, "text": text}
+            doc_entry: Dict[str, Any] = {"query_id": query_id, "text": text}
+            if tokenizer is not None:
+                encoded = tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=True,
+                    max_length=512,
+                    padding="max_length",
+                )
+                input_ids = encoded.get("input_ids")
+                attention_mask = encoded.get("attention_mask")
+                if input_ids is not None and attention_mask is not None:
+                    entropy = batch_entropy(input_ids, attention_mask)[0]
+                    doc_entry["entropy"] = float(entropy)
+            docs[doc_id] = doc_entry
             doc_id += 1
     return docs
 
@@ -139,11 +163,8 @@ def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
     return agent
 
 
-from tqdm import tqdm
-
-
 def generate_contexts(
-        docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
+        docs: Dict[int, Dict[str, Any]], model: COCOM, fallback_rate: int
 ) -> Dict[int, Dict[str, Any]]:
     try:
         device = next(model.parameters()).device
@@ -157,19 +178,20 @@ def generate_contexts(
     pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
 
     for doc_id, item in pbar:
+        text = item["text"]
+        stored_entropy = item.get("entropy")
         tokens = model.compr.tokenizer(
-            item["text"],
+            text,
             return_tensors="pt",
             truncation=True,
             max_length=512,
             padding="max_length",  # Add padding to fix size issues
         )
         selected_rate = fallback_rate
-        entropy: Optional[float] = None
-        if agent is not None:
-            entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
+        entropy: Optional[float] = stored_entropy
+        if agent is not None and stored_entropy is not None:
             try:
-                selected_rate = agent.select_rate(float(entropy))
+                selected_rate = agent.select_rate(float(stored_entropy))
             except Exception:
                 selected_rate = fallback_rate
 
@@ -222,7 +244,9 @@ def generate_embeddings(
     embeddings_array = embedder.encode(texts)
 
     embeddings: Dict[int, Dict[str, Any]] = {}
-    for idx, doc_id in enumerate(doc_ids):
+    for idx, doc_id in enumerate(
+        tqdm(doc_ids, desc="Packaging embeddings", leave=False, total=len(doc_ids))
+    ):
         embeddings[doc_id] = {
             "query_id": docs[doc_id]["query_id"],
             "embedding": embeddings_array[idx].tolist(),
@@ -233,7 +257,14 @@ def generate_embeddings(
 def main() -> None:
     args = parse_args()
 
-    docs = load_and_flatten(args.dataset)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = load_model_safely(args.checkpoint)
+    model.to(device)
+    model.eval()
+    print(device)
+
+    tokenizer = getattr(getattr(model, "compr", None), "tokenizer", None)
+    docs = load_and_flatten(args.dataset, tokenizer)
     docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
     print(
         "Extracted {count} MS MARCO passages -> {path} "
@@ -245,12 +276,6 @@ def main() -> None:
             json=docs_mem.get("json_disk_mb", 0.0),
         )
     )
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model_safely(args.checkpoint)
-    model.to(device)
-    model.eval()
-    print(device)
 
     if args.bandit_agent:
         bandit_path = args.bandit_agent
