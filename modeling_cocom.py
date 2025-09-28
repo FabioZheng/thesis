@@ -30,7 +30,7 @@ class BERT_Compressor(torch.nn.Module):
                 linear = torch.nn.Linear(self.model.config.hidden_size, decoder_hidden_size)
             self.linears.append(linear.bfloat16())
 
-    def _compress_rate(self, segment_compress_outputs, input_ids, rate, idx):
+    def _compress_rate(self, segment_compress_outputs, input_ids, attention_mask, rate, idx):
         num_embs = math.ceil(input_ids.size(1) / rate)
         hidden_states = []
 
@@ -39,6 +39,9 @@ class BERT_Compressor(torch.nn.Module):
                 start_idx = segment_idx * rate
                 end_idx = (segment_idx + 1) * rate
                 hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
+                if hidden_state.size(1) < rate:
+                    pad = hidden_state.new_zeros(hidden_state.size(0), rate - hidden_state.size(1), hidden_state.size(2))
+                    hidden_state = torch.cat([hidden_state, pad], dim=1)
                 hidden_state_concat = torch.flatten(hidden_state, start_dim=1)
                 hidden_states.append(hidden_state_concat)
         elif self.compressing_mode == "mean":
@@ -46,7 +49,18 @@ class BERT_Compressor(torch.nn.Module):
                 start_idx = segment_idx * rate
                 end_idx = (segment_idx + 1) * rate
                 hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
-                hidden_state_mean = torch.mean(hidden_state, dim=1)
+                segment_mask = attention_mask[:, start_idx:end_idx]
+                if hidden_state.size(1) < rate:
+                    pad = hidden_state.new_zeros(hidden_state.size(0), rate - hidden_state.size(1), hidden_state.size(2))
+                    hidden_state = torch.cat([hidden_state, pad], dim=1)
+                    segment_mask = torch.cat(
+                        [segment_mask, segment_mask.new_zeros(segment_mask.size(0), rate - segment_mask.size(1))], dim=1
+                    )
+
+                mask_expanded = segment_mask.unsqueeze(-1).to(hidden_state.dtype)
+                hidden_state_sum = (hidden_state * mask_expanded).sum(dim=1)
+                token_counts = mask_expanded.sum(dim=1).clamp(min=1)
+                hidden_state_mean = hidden_state_sum / token_counts
                 hidden_states.append(hidden_state_mean)
 
         hidden_states = torch.stack(hidden_states, dim=1)
@@ -61,11 +75,11 @@ class BERT_Compressor(torch.nn.Module):
             if rate not in self.compr_rates:
                 raise ValueError("Requested rate not initialized in compressor")
             idx = self.compr_rates.index(rate)
-            return self._compress_rate(segment_compress_outputs, input_ids, rate, idx)
+            return self._compress_rate(segment_compress_outputs, input_ids, attention_mask, rate, idx)
 
         all_results = []
         for i, r in enumerate(self.compr_rates):
-            all_results.append(self._compress_rate(segment_compress_outputs, input_ids, r, i))
+            all_results.append(self._compress_rate(segment_compress_outputs, input_ids, attention_mask, r, i))
 
         return all_results  # Returns a list of compressed embeddings for each rate
 
