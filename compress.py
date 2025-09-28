@@ -12,6 +12,7 @@ from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent, batch_entropy
+from utils import pad_tokens_to_rate
 
 
 def parse_args() -> argparse.Namespace:
@@ -137,8 +138,11 @@ def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
     return agent
 
 
+from tqdm import tqdm
+
+
 def generate_contexts(
-    docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
+        docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
 ) -> Dict[int, Dict[str, Any]]:
     try:
         device = next(model.parameters()).device
@@ -147,12 +151,17 @@ def generate_contexts(
 
     contexts: Dict[int, Dict[str, Any]] = {}
     agent = getattr(model, "bandit_agent", None)
-    for doc_id, item in docs.items():
+
+    # Add progress bar
+    pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
+
+    for doc_id, item in pbar:
         tokens = model.compr.tokenizer(
             item["text"],
             return_tensors="pt",
             truncation=True,
             max_length=512,
+            padding="max_length",  # Add padding to fix size issues
         )
         selected_rate = fallback_rate
         entropy: Optional[float] = None
@@ -162,7 +171,17 @@ def generate_contexts(
                 selected_rate = agent.select_rate(float(entropy))
             except Exception:
                 selected_rate = fallback_rate
+
+        pad_token_id = model.compr.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = (
+                model.compr.tokenizer.eos_token_id
+                if model.compr.tokenizer.eos_token_id is not None
+                else 0
+            )
+        tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
         tokens = {k: v.to(device) for k, v in tokens.items()}
+
         with torch.no_grad():
             emb = model.compr(
                 input_ids=tokens["input_ids"],
@@ -176,6 +195,10 @@ def generate_contexts(
         }
         if entropy is not None:
             contexts[doc_id]["entropy"] = entropy
+
+        # Update progress description
+        pbar.set_postfix({"rate": selected_rate, "entropy": entropy})
+
     return contexts
 
 
