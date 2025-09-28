@@ -12,6 +12,7 @@ from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent, batch_entropy
+from utils import pad_tokens_to_rate
 
 
 def parse_args() -> argparse.Namespace:
@@ -162,6 +163,14 @@ def generate_contexts(
                 selected_rate = agent.select_rate(float(entropy))
             except Exception:
                 selected_rate = fallback_rate
+        pad_token_id = model.compr.tokenizer.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = (
+                model.compr.tokenizer.eos_token_id
+                if model.compr.tokenizer.eos_token_id is not None
+                else 0
+            )
+        tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
         tokens = {k: v.to(device) for k, v in tokens.items()}
         with torch.no_grad():
             emb = model.compr(
