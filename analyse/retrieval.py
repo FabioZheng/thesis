@@ -104,6 +104,13 @@ def _sizeof_dict_bytes(d: Dict[str, Any], sample: int = 200) -> int:
     return int(total * (n / sample_n))
 
 
+def _l2_normalize(x: np.ndarray, axis: int = 1, eps: float = 1e-12) -> np.ndarray:
+    """L2-normalize ``x`` along ``axis`` with numerical stability."""
+    norm = np.linalg.norm(x, axis=axis, keepdims=True)
+    norm = np.maximum(norm, eps)
+    return x / norm
+
+
 # -----------------------------
 # Embedding model
 # -----------------------------
@@ -183,6 +190,7 @@ class CosineRetriever:
     def __post_init__(self):
         if self.embeddings.dtype != np.float32:
             self.embeddings = self.embeddings.astype(np.float32)
+        self.embeddings = _l2_normalize(self.embeddings, axis=1)
 
     def _cosine_topk(
         self, q: np.ndarray, k: int = 5
@@ -200,6 +208,7 @@ class CosineRetriever:
         self, query: str, query_embedder: TextEmbedder, k: int = 5
     ) -> List[Tuple[str, float, str]]:
         q_emb = query_embedder.encode([query])[0].astype(np.float32)
+        q_emb = _l2_normalize(q_emb[None, :], axis=1)[0]
         hits = self._cosine_topk(q_emb, k=k)
         # attach text
         return [(doc_id, score, self.store[doc_id]["text"]) for doc_id, score in hits]
@@ -302,9 +311,11 @@ def render_embeddings_block(
 
     if st.button("Build embeddings"):
         with st.spinner("Encoding corpus..."):
-            embedder = TextEmbedder(model_name=model_name, normalize=True, batch_size=batch_size)
+            embedder = TextEmbedder(model_name=model_name, normalize=False, batch_size=batch_size)
             encoder = CorpusEncoder(embedder=embedder)
             embeddings, doc_ids, store = encoder.build_from_dataframe(df, text_col, id_prefix="doc")
+
+        embeddings_norm = _l2_normalize(embeddings, axis=1)
 
         # --- Sizes & footprints ---
         # 1) dict store approx RAM
@@ -352,7 +363,8 @@ def render_embeddings_block(
         st.plotly_chart(fig, use_container_width=True)
 
         # Keep in session for live retrieval
-        st.session_state["__embeddings"] = embeddings
+        st.session_state["__embeddings"] = embeddings_norm
+        st.session_state["__embeddings_raw"] = embeddings
         st.session_state["__doc_ids"] = doc_ids
         st.session_state["__store"] = store
         st.session_state["__embedder_name"] = model_name
@@ -367,7 +379,7 @@ def render_embeddings_block(
                 st.warning(f"Provide query text to search ({label}).")
                 return
             with st.spinner("Embedding query & searching..."):
-                q_embedder = TextEmbedder(model_name=st.session_state["__embedder_name"], normalize=True)
+                q_embedder = TextEmbedder(model_name=st.session_state["__embedder_name"], normalize=False)
                 retriever = CosineRetriever(
                     embeddings=st.session_state["__embeddings"],
                     doc_ids=st.session_state["__doc_ids"],
