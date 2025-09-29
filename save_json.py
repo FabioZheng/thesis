@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Union
+import pickle
+import sys
+from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple, Union
 
 import pandas as pd
 from datasets import Dataset, IterableDataset, load_dataset
@@ -178,6 +180,69 @@ def load_and_flatten(dataset_source: RowIterable) -> Dict[int, Dict[str, Union[s
     return docs
 
 
+def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
+    """Approximate the in-memory footprint of ``obj`` and its serialised size."""
+
+    base_size = sys.getsizeof(obj)
+
+    if isinstance(obj, dict):
+        items = list(obj.items())
+    elif isinstance(obj, list):
+        items = list(enumerate(obj))
+    else:
+        items = []
+
+    sample_size = min(len(items), 100)
+    sampled_bytes = 0
+    for key, value in items[:sample_size]:
+        sampled_bytes += sys.getsizeof(key)
+        sampled_bytes += sys.getsizeof(value)
+
+    multiplier = (len(items) / sample_size) if sample_size else 1
+    approx_bytes = base_size + sampled_bytes * multiplier
+
+    try:
+        serialized = pickle.dumps(obj)
+        pickle_bytes = len(serialized)
+    except Exception:  # pragma: no cover - defensive serialisation attempt
+        pickle_bytes = 0
+
+    return {
+        "approx_memory_mb": approx_bytes / (1024 * 1024),
+        "pickle_disk_mb": pickle_bytes / (1024 * 1024),
+    }
+
+
+def save_json_to_path(
+    data: Mapping[Any, Any],
+    path: str,
+    *,
+    ensure_directory: bool = True,
+) -> Tuple[str, Dict[str, float]]:
+    """Persist ``data`` to ``path`` and report memory/disk usage statistics."""
+
+    directory = os.path.dirname(path)
+    if ensure_directory and directory:
+        os.makedirs(directory, exist_ok=True)
+
+    mem_stats = _estimate_memory_usage(data)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False)
+
+    mem_stats["json_disk_mb"] = os.path.getsize(path) / (1024 * 1024)
+    return path, mem_stats
+
+
+def save_json(
+    data: Mapping[Any, Any], directory: str, filename: str
+) -> Tuple[str, Dict[str, float]]:
+    """Persist ``data`` inside ``directory`` and report memory/disk usage."""
+
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+    return save_json_to_path(data, path, ensure_directory=False)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -214,9 +279,17 @@ def main() -> None:
     docs = load_and_flatten(dataset)
 
     out_file = args.out or f"{args.dataset.replace('/', '_')}_{args.split}_flattened.json"
-    print(f"💾 Saving {len(docs)} passages to {out_file}")
-    with open(out_file, "w", encoding="utf-8") as handle:
-        json.dump(docs, handle, ensure_ascii=False)
+    path, mem_stats = save_json_to_path(docs, out_file)
+    print(
+        "💾 Saved {count} passages to {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=len(docs),
+            path=path,
+            mem=mem_stats.get("approx_memory_mb", 0.0),
+            pickle=mem_stats.get("pickle_disk_mb", 0.0),
+            json=mem_stats.get("json_disk_mb", 0.0),
+        )
+    )
 
     print("✅ Done!")
 
