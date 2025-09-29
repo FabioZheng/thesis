@@ -1,11 +1,8 @@
 import argparse
-import json
 import os
 import pickle
-import sys
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import torch
 
 from analyse.retrieval import TextEmbedder
@@ -14,6 +11,7 @@ from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent
 from metrics import batch_entropy
 from utils import pad_tokens_to_rate
+from save_json import load_and_flatten, save_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,71 +54,6 @@ def parse_args() -> argparse.Namespace:
         help="Disable embedding normalization in TextEmbedder",
     )
     return parser.parse_args()
-
-
-def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
-    df = pd.read_json(dataset_path, lines=True)
-
-    docs: Dict[int, Dict[str, str]] = {}
-    doc_id = 0
-    for _, row in df.iterrows():
-        query_id = row.get("query_id")
-        passages_field = row.get("passages", {})
-        passage_texts: List[str] = []
-        if isinstance(passages_field, dict):
-            if "passages" in passages_field:
-                passage_texts = passages_field.get("passages", [])
-            else:
-                passage_texts = passages_field.get("passage_text", [])
-        for passage in passage_texts:
-            if passage is None:
-                continue
-            text = passage if isinstance(passage, str) else str(passage)
-            docs[doc_id] = {"query_id": query_id, "text": text}
-            doc_id += 1
-    return docs
-
-
-def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
-    base_size = sys.getsizeof(obj)
-
-    if isinstance(obj, dict):
-        items = list(obj.items())
-    elif isinstance(obj, list):
-        items = list(enumerate(obj))
-    else:
-        items = []
-
-    sample_size = min(len(items), 100)
-    sampled_bytes = 0
-    for key, value in items[:sample_size]:
-        sampled_bytes += sys.getsizeof(key)
-        sampled_bytes += sys.getsizeof(value)
-
-    multiplier = (len(items) / sample_size) if sample_size else 1
-    approx_bytes = base_size + sampled_bytes * multiplier
-
-    try:
-        serialized = pickle.dumps(obj)
-        pickle_bytes = len(serialized)
-    except Exception:
-        pickle_bytes = 0
-
-    return {
-        "approx_memory_mb": approx_bytes / (1024 * 1024),
-        "pickle_disk_mb": pickle_bytes / (1024 * 1024),
-    }
-
-
-def save_json(data: Dict, directory: str, filename: str) -> tuple[str, Dict[str, float]]:
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
-    mem_stats = _estimate_memory_usage(data)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    mem_stats["json_disk_mb"] = os.path.getsize(path) / (1024 * 1024)
-    return path, mem_stats
-
 
 def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
     with open(path, "rb") as f:

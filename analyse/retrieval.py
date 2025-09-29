@@ -252,7 +252,11 @@ def plot_embeddings_pca(
 # -----------------------------
 # Streamlit block (optional)
 # -----------------------------
-def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List[str]] = None):
+def render_embeddings_block(
+    df: pd.DataFrame,
+    candidate_text_cols: Optional[List[str]] = None,
+    queries: Optional[pd.DataFrame] = None,
+):
     """
     Streamlit UI to:
       - pick a text column (defaults to 'text' or 'passage' if present)
@@ -265,6 +269,19 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
         raise RuntimeError("Streamlit not available. Install streamlit to use this UI helper.")
 
     st.header("🧩 Embeddings & Retrieval")
+
+    queries_df = None
+    if queries is not None:
+        try:
+            queries_df = queries.copy()
+            if 'query_id' in queries_df.columns and 'query_text' in queries_df.columns:
+                queries_df = queries_df.dropna(subset=['query_id', 'query_text'])
+                queries_df['query_id'] = queries_df['query_id'].astype(str)
+                queries_df['query_text'] = queries_df['query_text'].astype(str)
+            else:
+                queries_df = None
+        except Exception:
+            queries_df = None
 
     # Pick text column
     all_cols = list(df.columns)
@@ -343,9 +360,12 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
     # Retrieval demo (if available)
     if "__embeddings" in st.session_state:
         st.subheader("🔎 Try a query")
-        q = st.text_input("Query text", value="how to relieve sore throat")
         k = st.number_input("Top-K", min_value=1, max_value=50, value=5)
-        if st.button("Search"):
+
+        def _run_search(query_text: str, label: str) -> None:
+            if not query_text:
+                st.warning(f"Provide query text to search ({label}).")
+                return
             with st.spinner("Embedding query & searching..."):
                 q_embedder = TextEmbedder(model_name=st.session_state["__embedder_name"], normalize=True)
                 retriever = CosineRetriever(
@@ -353,12 +373,34 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
                     doc_ids=st.session_state["__doc_ids"],
                     store=st.session_state["__store"],
                 )
-                hits = retriever.search(q, q_embedder, k=int(k))
+                hits = retriever.search(query_text, q_embedder, k=int(k))
 
             for rank, (doc_id, score, text) in enumerate(hits, 1):
                 st.markdown(f"**{rank}. {doc_id}** — cos={score:.4f}")
                 st.write(text[:600] + ("..." if len(text) > 600 else ""))
                 st.markdown("---")
+
+        custom_query = st.text_input("Custom query text", value="how to relieve sore throat")
+        if st.button("Search custom query"):
+            _run_search(custom_query, "custom query")
+
+        if queries_df is not None and not queries_df.empty:
+            st.markdown("#### Or choose from uploaded queries")
+            query_records = queries_df.to_dict("records")
+
+            def _format_query_option(record: Dict[str, str]) -> str:
+                preview = record.get("query_text", "")
+                preview = preview.replace("\n", " ")
+                if len(preview) > 80:
+                    preview = preview[:77] + "..."
+                return f"{record.get('query_id', '')}: {preview}"
+
+            selected_idx = st.selectbox(
+                "Select a query", list(range(len(query_records))), format_func=lambda i: _format_query_option(query_records[i])
+            )
+            if st.button("Search selected query"):
+                selected = query_records[int(selected_idx)]
+                _run_search(selected.get("query_text", ""), f"query {selected.get('query_id', '')}")
 
 
 def render_clustering_block():
