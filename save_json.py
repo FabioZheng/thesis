@@ -16,7 +16,7 @@ import sys
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple, Union
 
 import pandas as pd
-from datasets import Dataset, IterableDataset, load_dataset
+from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 
 
 TEXT_CONTAINER_KEYS: Sequence[str] = (
@@ -130,6 +130,7 @@ def _extract_passage_texts(row: Mapping[str, Any]) -> list[str]:
 RowIterable = Union[
     str,
     Dataset,
+    DatasetDict,
     IterableDataset,
     Iterable[Mapping[str, Any]],
 ]
@@ -149,6 +150,13 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
             yield dict(row)
         return
 
+    if isinstance(dataset_source, DatasetDict):
+        for split_name in sorted(dataset_source.keys()):
+            split = dataset_source[split_name]
+            for row in split:
+                yield dict(row)
+        return
+
     if isinstance(dataset_source, IterableDataset):
         for row in dataset_source:
             yield dict(row)
@@ -162,7 +170,12 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
 
 
 def load_and_flatten(dataset_source: RowIterable) -> Dict[int, Dict[str, Union[str, int, float, None]]]:
-    """Load a dataset and flatten it into doc-indexed records."""
+    """Load a dataset-like object and flatten it into doc-indexed records.
+
+    ``dataset_source`` can be a path to a JSON/JSONL file, a Hugging Face
+    ``Dataset``/``DatasetDict``/``IterableDataset`` instance, or any iterable of
+    mapping-like rows.
+    """
 
     docs: Dict[int, Dict[str, Union[str, int, float, None]]] = {}
     doc_id = 0
