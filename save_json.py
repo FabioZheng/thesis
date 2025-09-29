@@ -22,6 +22,7 @@ from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
 TEXT_CONTAINER_KEYS: Sequence[str] = (
     "passages",
     "passage_text",
+    "passage_texts",
     "passage",
     "documents",
     "document",
@@ -32,6 +33,15 @@ TEXT_CONTAINER_KEYS: Sequence[str] = (
     "content",
     "body",
     "text",
+)
+
+NON_TEXT_KEYS: Sequence[str] = (
+    "url",
+    "urls",
+    "passage_url",
+    "passage_urls",
+    "is_selected",
+    "is_selecteds",
 )
 
 QUERY_ID_KEYS: Sequence[str] = (
@@ -52,6 +62,20 @@ QUERY_TEXT_KEYS: Sequence[str] = (
     "title",
     "text",
 )
+
+
+TEXT_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in TEXT_CONTAINER_KEYS)
+NON_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in NON_TEXT_KEYS)
+QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEYS)
+QUERY_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_TEXT_KEYS)
+
+
+def _find_matching_value(mapping: Mapping[str, Any], ordered_keys: Sequence[str]) -> Any:
+    for candidate in ordered_keys:
+        for key, value in mapping.items():
+            if isinstance(key, str) and key.lower() == candidate:
+                return value
+    return None
 
 
 def _to_scalar(value: Any) -> Union[str, int, float, None]:
@@ -96,10 +120,16 @@ def _flatten_text_container(value: Any) -> list[str]:
 
     if isinstance(value, Mapping):
         # Prioritise well-known keys before traversing the rest of the mapping.
-        for key in TEXT_CONTAINER_KEYS:
-            if key in value:
-                texts.extend(_flatten_text_container(value[key]))
-        for item in value.values():
+        for candidate in TEXT_CONTAINER_KEYS_LOWER:
+            matched = _find_matching_value(value, (candidate,))
+            if matched is not None:
+                texts.extend(_flatten_text_container(matched))
+        for key, item in value.items():
+            lowered = key.lower() if isinstance(key, str) else key
+            if isinstance(lowered, str) and (
+                lowered in TEXT_CONTAINER_KEYS_LOWER or lowered in NON_TEXT_KEYS_LOWER
+            ):
+                continue
             texts.extend(_flatten_text_container(item))
         return texts
 
@@ -114,19 +144,22 @@ def _flatten_text_container(value: Any) -> list[str]:
 
 
 def _extract_query_id(row: Mapping[str, Any]) -> Union[str, int, float, None]:
-    for key in QUERY_ID_KEYS:
-        if key in row:
-            scalar = _to_scalar(row[key])
-            if scalar is not None:
-                return scalar
+    for candidate in QUERY_ID_KEYS_LOWER:
+        value = _find_matching_value(row, (candidate,)) if hasattr(row, "items") else None
+        if value is None:
+            continue
+        scalar = _to_scalar(value)
+        if scalar is not None:
+            return scalar
     return None
 
 
 def _extract_passage_texts(row: Mapping[str, Any]) -> list[str]:
     texts: list[str] = []
-    for key in TEXT_CONTAINER_KEYS:
-        if key in row:
-            texts.extend(_flatten_text_container(row[key]))
+    for candidate in TEXT_CONTAINER_KEYS_LOWER:
+        value = _find_matching_value(row, (candidate,))
+        if value is not None:
+            texts.extend(_flatten_text_container(value))
     # Deduplicate while preserving order
     seen: set[str] = set()
     unique_texts: list[str] = []
@@ -229,11 +262,13 @@ def load_and_flatten(
 
 
 def _extract_query_text(row: Mapping[str, Any]) -> Union[str, None]:
-    for key in QUERY_TEXT_KEYS:
-        if key in row:
-            texts = _flatten_text_container(row[key])
-            if texts:
-                return texts[0]
+    for candidate in QUERY_TEXT_KEYS_LOWER:
+        value = _find_matching_value(row, (candidate,)) if hasattr(row, "items") else None
+        if value is None:
+            continue
+        texts = _flatten_text_container(value)
+        if texts:
+            return texts[0]
     return None
 
 
