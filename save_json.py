@@ -138,7 +138,7 @@ RowIterable = Union[
 
 def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
     if isinstance(dataset_source, str):
-        if not os.path.exists(dataset_source):
+        if not os.path.isfile(dataset_source):
             raise FileNotFoundError(f"Dataset file not found: {dataset_source}")
         frame = pd.read_json(dataset_source, lines=True)
         for row in frame.to_dict(orient="records"):
@@ -169,13 +169,38 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
             yield dict(row)
 
 
-def load_and_flatten(dataset_source: RowIterable) -> Dict[int, Dict[str, Union[str, int, float, None]]]:
+def load_and_flatten(
+    dataset_source: RowIterable,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> Dict[int, Dict[str, Union[str, int, float, None]]]:
     """Load a dataset-like object and flatten it into doc-indexed records.
 
     ``dataset_source`` can be a path to a JSON/JSONL file, a Hugging Face
-    ``Dataset``/``DatasetDict``/``IterableDataset`` instance, or any iterable of
-    mapping-like rows.
+    ``Dataset``/``DatasetDict``/``IterableDataset`` instance, the name of a
+    dataset on the Hugging Face Hub, or any iterable of mapping-like rows. When
+    ``dataset_source`` is a Hugging Face dataset identifier the optional
+    ``split``, ``name`` and ``load_dataset_kwargs`` arguments are forwarded to
+    :func:`datasets.load_dataset`.
     """
+
+    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
+        dataset_identifier = dataset_source
+        load_kwargs = dict(load_dataset_kwargs or {})
+        if split is not None:
+            load_kwargs.setdefault("split", split)
+        if name is not None:
+            load_kwargs.setdefault("name", name)
+
+        try:
+            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
+        except Exception as error:  # pragma: no cover - network/IO heavy
+            raise ValueError(
+                "Failed to load dataset using datasets.load_dataset; "
+                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
+            ) from error
 
     docs: Dict[int, Dict[str, Union[str, int, float, None]]] = {}
     doc_id = 0
@@ -289,7 +314,7 @@ def main() -> None:
     dataset = load_dataset(args.dataset, split=args.split, name=args.name)
 
     print("🧹 Flattening dataset structure")
-    docs = load_and_flatten(dataset)
+    docs = load_and_flatten(dataset, split=args.split, name=args.name)
 
     out_file = args.out or f"{args.dataset.replace('/', '_')}_{args.split}_flattened.json"
     path, mem_stats = save_json_to_path(docs, out_file)
