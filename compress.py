@@ -5,7 +5,6 @@ import pickle
 import sys
 from typing import Any, Dict, List, Optional
 
-import pandas as pd
 import torch
 
 from analyse.retrieval import TextEmbedder
@@ -14,6 +13,7 @@ from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent
 from metrics import batch_entropy
 from utils import pad_tokens_to_rate
+from save_json import load_and_flatten
 
 
 def parse_args() -> argparse.Namespace:
@@ -56,30 +56,6 @@ def parse_args() -> argparse.Namespace:
         help="Disable embedding normalization in TextEmbedder",
     )
     return parser.parse_args()
-
-
-def load_and_flatten(dataset_path: str) -> Dict[int, Dict[str, str]]:
-    df = pd.read_json(dataset_path, lines=True)
-
-    docs: Dict[int, Dict[str, str]] = {}
-    doc_id = 0
-    for _, row in df.iterrows():
-        query_id = row.get("query_id")
-        passages_field = row.get("passages", {})
-        passage_texts: List[str] = []
-        if isinstance(passages_field, dict):
-            if "passages" in passages_field:
-                passage_texts = passages_field.get("passages", [])
-            else:
-                passage_texts = passages_field.get("passage_text", [])
-        for passage in passage_texts:
-            if passage is None:
-                continue
-            text = passage if isinstance(passage, str) else str(passage)
-            docs[doc_id] = {"query_id": query_id, "text": text}
-            doc_id += 1
-    return docs
-
 
 def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
     base_size = sys.getsizeof(obj)
