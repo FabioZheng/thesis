@@ -329,7 +329,12 @@ def render_embeddings_block(
         emb_df = pd.DataFrame(embeddings)
         emb_df_mb = emb_df.memory_usage(deep=True).sum() / (1024 * 1024)
 
-        # 4) pickle disk size for embeddings ndarray
+        # 4) embedding norm statistics (before normalization)
+        norms = np.linalg.norm(embeddings, axis=1)
+        norm_mean = float(norms.mean()) if len(norms) else 0.0
+        norm_std = float(norms.std(ddof=1)) if len(norms) > 1 else 0.0
+
+        # 5) pickle disk size for embeddings ndarray
         tmp_pkl = "embeddings_tmp.pkl"
         try:
             import pickle
@@ -348,7 +353,7 @@ def render_embeddings_block(
         )
 
         # Show metrics in a compact row
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3, c4, c5 = st.columns(5)
         with c1:
             st.metric("Store dict (approx RAM)", f"{dict_mb:.2f} MB")
         with c2:
@@ -357,6 +362,9 @@ def render_embeddings_block(
             st.metric("Embeddings DataFrame (RAM)", f"{emb_df_mb:.2f} MB")
         with c4:
             st.metric("Embeddings Pickle (Disk)", f"{emb_pkl_mb:.2f} MB")
+        with c5:
+            st.metric("Embedding norm σ", f"{norm_std:.4f}", delta=f"μ={norm_mean:.4f}")
+        st.caption("Norm statistics computed from raw embeddings prior to L2 normalization.")
 
         # Scatter (PCA)
         fig = plot_embeddings_pca(embeddings, doc_ids, sample=1000)
