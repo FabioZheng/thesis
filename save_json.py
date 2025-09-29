@@ -359,6 +359,43 @@ def save_queries_json(
     return save_json(queries, directory, filename)
 
 
+def trim_json_file(
+    input_path: str,
+    output_path: str,
+    limit: int,
+    *,
+    ensure_directory: bool = True,
+) -> Tuple[str, Dict[str, float]]:
+    """Trim a JSON document to ``limit`` entries and persist the result."""
+
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+
+    if not os.path.isfile(input_path):
+        raise FileNotFoundError(f"Input JSON file not found: {input_path}")
+
+    with open(input_path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+
+    if isinstance(data, dict):
+        if limit == 0:
+            trimmed = {}
+        else:
+            items = list(data.items())[:limit]
+            trimmed = dict(items)
+    elif isinstance(data, list):
+        if limit == 0:
+            trimmed = []
+        else:
+            trimmed = data[:limit]
+    else:
+        raise TypeError(
+            "Unsupported JSON structure; expected an object or array at the root"
+        )
+
+    return save_json_to_path(trimmed, output_path, ensure_directory=ensure_directory)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
