@@ -60,9 +60,11 @@ class DatasetAnalyzer:
         self.data_dict = None
         self.text_columns = []
         self.target_column = None
+        self.queries_df = None
 
     def load_sample_dataset(self, dataset_name):
         self.dataset_name = dataset_name
+        self.queries_df = None
         if dataset_name == "20newsgroups":
             data = fetch_20newsgroups(subset='all', remove=('headers', 'footers', 'quotes'))
             df = pd.DataFrame({
@@ -95,28 +97,90 @@ class DatasetAnalyzer:
         self.dataset = df
         return df
 
-    def load_custom_dataset(self, file_path):
+    def load_custom_dataset(self, file_path, queries_path=None):
+        self.queries_df = None
         try:
-            if file_path.endswith('.csv'):
-                df = pd.read_csv(file_path)
-            elif file_path.endswith('.json') or file_path.endswith('.jsonl'):
-                df = pd.read_json(file_path, lines=file_path.endswith('.jsonl'))
-            elif file_path.endswith('.xlsx'):
-                df = pd.read_excel(file_path)
+            if queries_path:
+                if not file_path.endswith('.json'):
+                    st.error("When providing a queries JSON, the documents file must be a JSON produced by save_json.")
+                    return None
+
+                with open(file_path, 'r', encoding='utf-8') as doc_handle:
+                    doc_payload = json.load(doc_handle)
+
+                if isinstance(doc_payload, dict):
+                    records = []
+                    for doc_id, value in doc_payload.items():
+                        record = {'doc_id': str(doc_id)}
+                        if isinstance(value, dict):
+                            record.update(value)
+                        else:
+                            record['text'] = str(value)
+                        records.append(record)
+                    df = pd.DataFrame(records)
+                else:
+                    st.error("Unsupported documents JSON structure. Expected a mapping of doc_id to {query_id, text}.")
+                    return None
+
+                with open(queries_path, 'r', encoding='utf-8') as query_handle:
+                    query_payload = json.load(query_handle)
+
+                query_rows = []
+                if isinstance(query_payload, dict):
+                    iterator = query_payload.items()
+                elif isinstance(query_payload, list):
+                    iterator = [(item.get('query_id'), item) for item in query_payload if isinstance(item, dict)]
+                else:
+                    iterator = []
+
+                for qid, value in iterator:
+                    if qid is None:
+                        continue
+                    text = None
+                    if isinstance(value, dict):
+                        text = value.get('text') or value.get('query') or value.get('question')
+                        if text is None:
+                            for candidate in value.values():
+                                if isinstance(candidate, str) and candidate.strip():
+                                    text = candidate
+                                    break
+                    else:
+                        text = str(value)
+
+                    if text is None:
+                        continue
+                    query_rows.append({'query_id': str(qid), 'query_text': str(text)})
+
+                self.queries_df = pd.DataFrame(query_rows) if query_rows else None
+
+                if self.queries_df is not None and 'query_id' in df.columns:
+                    df['query_id'] = df['query_id'].astype(str)
+                    lookup = dict(zip(self.queries_df['query_id'], self.queries_df['query_text']))
+                    df['query_text'] = df['query_id'].map(lookup)
+
             else:
-                st.error("Unsupported file format. Please use CSV, JSON/JSONL, or Excel files.")
-                return None
+                if file_path.endswith('.csv'):
+                    df = pd.read_csv(file_path)
+                elif file_path.endswith('.json') or file_path.endswith('.jsonl'):
+                    df = pd.read_json(file_path, lines=file_path.endswith('.jsonl'))
+                elif file_path.endswith('.xlsx'):
+                    df = pd.read_excel(file_path)
+                else:
+                    st.error("Unsupported file format. Please use CSV, JSON/JSONL, or Excel files.")
+                    return None
 
             self.dataset = df
             self.dataset_name = os.path.basename(file_path)
 
-            # Auto-detect text columns
             self.text_columns = []
             for col in df.columns:
                 if df[col].dtype == 'object':
                     avg_length = df[col].astype(str).str.len().mean()
                     if avg_length > 20:
                         self.text_columns.append(col)
+            if 'text' in df.columns and 'text' not in self.text_columns:
+                self.text_columns.insert(0, 'text')
+            self.target_column = None
             return df
         except Exception as e:
             st.error(f"Error loading dataset: {str(e)}")
@@ -143,6 +207,7 @@ class DatasetAnalyzer:
 
         self.dataset = df
         self.dataset_name = f"HF:{path}" + (f"/{name}" if name else "") + f" [{split}]"
+        self.queries_df = None
 
         self.text_columns = []
         for col in df.columns:
@@ -433,6 +498,7 @@ def _persist_after_load(analyzer: DatasetAnalyzer):
     st.session_state["_ds_name"] = analyzer.dataset_name
     st.session_state["_text_cols"] = analyzer.text_columns
     st.session_state["_target_col"] = analyzer.target_column
+    st.session_state["_queries_df"] = analyzer.queries_df
 
 def _restore_into(analyzer: DatasetAnalyzer):
     if "_ds" in st.session_state and st.session_state["_ds"] is not None:
@@ -440,6 +506,7 @@ def _restore_into(analyzer: DatasetAnalyzer):
         analyzer.dataset_name = st.session_state.get("_ds_name")
         analyzer.text_columns = st.session_state.get("_text_cols", [])
         analyzer.target_column = st.session_state.get("_target_col")
+        analyzer.queries_df = st.session_state.get("_queries_df")
 
 
 def main():
@@ -472,20 +539,43 @@ def main():
                 _persist_after_load(analyzer)
 
     elif dataset_source == "Upload Custom Dataset":
-        uploaded_file = st.sidebar.file_uploader(
-            "Upload your dataset",
+        uploaded_docs = st.sidebar.file_uploader(
+            "Upload documents dataset",
             type=['csv', 'json', 'jsonl', 'xlsx'],
-            key="__uploader"
+            key="__uploader_docs"
         )
-        if uploaded_file is not None and st.sidebar.button("Load Dataset", key="__load_upload"):
-            with st.spinner("Loading dataset..."):
-                temp_path = f"temp_{uploaded_file.name}"
-                with open(temp_path, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                analyzer.load_custom_dataset(temp_path)
-                os.remove(temp_path)
-                st.success(f"Loaded {uploaded_file.name}!")
-                _persist_after_load(analyzer)
+        uploaded_queries = st.sidebar.file_uploader(
+            "Upload queries JSON (optional)",
+            type=['json'],
+            key="__uploader_queries"
+        )
+        if st.sidebar.button("Load Dataset", key="__load_upload"):
+            if uploaded_docs is None:
+                st.sidebar.error("Please upload a documents file.")
+            else:
+                temp_paths = []
+                try:
+                    temp_doc_path = f"temp_{uploaded_docs.name}"
+                    with open(temp_doc_path, "wb") as f:
+                        f.write(uploaded_docs.getbuffer())
+                    temp_paths.append(temp_doc_path)
+
+                    temp_query_path = None
+                    if uploaded_queries is not None:
+                        temp_query_path = f"temp_{uploaded_queries.name}"
+                        with open(temp_query_path, "wb") as f:
+                            f.write(uploaded_queries.getbuffer())
+                        temp_paths.append(temp_query_path)
+
+                    with st.spinner("Loading dataset..."):
+                        df = analyzer.load_custom_dataset(temp_doc_path, queries_path=temp_query_path)
+                        if df is not None:
+                            st.success(f"Loaded {uploaded_docs.name}!")
+                            _persist_after_load(analyzer)
+                finally:
+                    for path in temp_paths:
+                        if path and os.path.exists(path):
+                            os.remove(path)
 
     else:  # Hugging Face
         st.sidebar.caption("Load datasets from the Hugging Face Hub via `datasets.load_dataset`.")
@@ -604,7 +694,11 @@ def main():
         # Retrieval sandbox (embedding UI)
         st.header("🧭 Retrieval Sandbox")
         from retrieval import render_embeddings_block, render_clustering_block
-        render_embeddings_block(analyzer.dataset, candidate_text_cols=analyzer.text_columns)
+        render_embeddings_block(
+            analyzer.dataset,
+            candidate_text_cols=analyzer.text_columns,
+            queries=analyzer.queries_df,
+        )
         render_clustering_block()
 
 

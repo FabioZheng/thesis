@@ -44,6 +44,16 @@ QUERY_ID_KEYS: Sequence[str] = (
 )
 
 
+QUERY_TEXT_KEYS: Sequence[str] = (
+    "query",
+    "question",
+    "query_text",
+    "question_text",
+    "title",
+    "text",
+)
+
+
 def _to_scalar(value: Any) -> Union[str, int, float, None]:
     """Extract a scalar identifier from potentially nested containers."""
 
@@ -218,6 +228,54 @@ def load_and_flatten(
     return docs
 
 
+def _extract_query_text(row: Mapping[str, Any]) -> Union[str, None]:
+    for key in QUERY_TEXT_KEYS:
+        if key in row:
+            texts = _flatten_text_container(row[key])
+            if texts:
+                return texts[0]
+    return None
+
+
+def load_queries(
+    dataset_source: RowIterable,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> Dict[str, Dict[str, str]]:
+    """Load a dataset-like object and extract a mapping of query_id to text."""
+
+    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
+        dataset_identifier = dataset_source
+        load_kwargs = dict(load_dataset_kwargs or {})
+        if split is not None:
+            load_kwargs.setdefault("split", split)
+        if name is not None:
+            load_kwargs.setdefault("name", name)
+
+        try:
+            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
+        except Exception as error:  # pragma: no cover - network/IO heavy
+            raise ValueError(
+                "Failed to load dataset using datasets.load_dataset; "
+                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
+            ) from error
+
+    queries: Dict[str, Dict[str, str]] = {}
+
+    for row in _iter_rows(dataset_source):
+        query_id = _extract_query_id(row)
+        if query_id is None:
+            continue
+        query_text = _extract_query_text(row)
+        if not query_text:
+            continue
+        queries[str(query_id)] = {"text": query_text}
+
+    return queries
+
+
 def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
     """Approximate the in-memory footprint of ``obj`` and its serialised size."""
 
@@ -281,6 +339,26 @@ def save_json(
     return save_json_to_path(data, path, ensure_directory=False)
 
 
+def save_queries_json(
+    dataset_source: RowIterable,
+    directory: str,
+    filename: str = "queries.json",
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> Tuple[str, Dict[str, float]]:
+    """Extract queries and persist them as ``{query_id: {"text": ...}}`` JSON."""
+
+    queries = load_queries(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
+    return save_json(queries, directory, filename)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
@@ -307,6 +385,12 @@ def main() -> None:
             "Destination JSON file. Defaults to <dataset>_<split>_flattened.json"
         ),
     )
+    parser.add_argument(
+        "--queries-out",
+        type=str,
+        default=None,
+        help="Optional path to persist query_id to query text mapping as JSON",
+    )
 
     args = parser.parse_args()
 
@@ -328,6 +412,24 @@ def main() -> None:
             json=mem_stats.get("json_disk_mb", 0.0),
         )
     )
+
+    if args.queries_out:
+        print("🧾 Extracting queries")
+        queries = load_queries(dataset)
+        if not queries:
+            print("⚠️ No queries found in dataset; skipping query export.")
+        else:
+            q_path, q_stats = save_json_to_path(queries, args.queries_out)
+            print(
+                "📝 Saved {count} queries to {path} "
+                "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+                    count=len(queries),
+                    path=q_path,
+                    mem=q_stats.get("approx_memory_mb", 0.0),
+                    pickle=q_stats.get("pickle_disk_mb", 0.0),
+                    json=q_stats.get("json_disk_mb", 0.0),
+                )
+            )
 
     print("✅ Done!")
 
