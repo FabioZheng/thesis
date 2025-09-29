@@ -334,7 +334,13 @@ def render_embeddings_block(
         norm_mean = float(norms.mean()) if len(norms) else 0.0
         norm_std = float(norms.std(ddof=1)) if len(norms) > 1 else 0.0
 
-        # 5) pickle disk size for embeddings ndarray
+        # 5) per-dimension standard deviation (before normalization)
+        if embeddings.size and len(embeddings) > 1:
+            dim_std = embeddings.std(axis=0, ddof=1)
+        else:
+            dim_std = np.zeros(embeddings.shape[1], dtype=np.float32)
+
+        # 6) pickle disk size for embeddings ndarray
         tmp_pkl = "embeddings_tmp.pkl"
         try:
             import pickle
@@ -365,6 +371,13 @@ def render_embeddings_block(
         with c5:
             st.metric("Embedding norm σ", f"{norm_std:.4f}", delta=f"μ={norm_mean:.4f}")
         st.caption("Norm statistics computed from raw embeddings prior to L2 normalization.")
+
+        with st.expander("Per-dimension standard deviation (raw embeddings)"):
+            dim_std_df = pd.DataFrame({
+                "dimension": np.arange(dim_std.shape[0]),
+                "std": dim_std,
+            })
+            st.dataframe(dim_std_df)
 
         # Scatter (PCA)
         fig = plot_embeddings_pca(embeddings, doc_ids, sample=1000)
