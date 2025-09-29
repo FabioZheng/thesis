@@ -285,9 +285,15 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
 
     if st.button("Build embeddings"):
         with st.spinner("Encoding corpus..."):
-            embedder = TextEmbedder(model_name=model_name, normalize=True, batch_size=batch_size)
+            embedder = TextEmbedder(
+                model_name=model_name,
+                normalize=False,
+                batch_size=batch_size,
+            )
             encoder = CorpusEncoder(embedder=embedder)
-            embeddings, doc_ids, store = encoder.build_from_dataframe(df, text_col, id_prefix="doc")
+            embeddings, doc_ids, store = encoder.build_from_dataframe(
+                df, text_col, id_prefix="doc"
+            )
 
         # --- Sizes & footprints ---
         # 1) dict store approx RAM
@@ -335,7 +341,12 @@ def render_embeddings_block(df: pd.DataFrame, candidate_text_cols: Optional[List
         st.plotly_chart(fig, use_container_width=True)
 
         # Keep in session for live retrieval
-        st.session_state["__embeddings"] = embeddings
+        norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+        safe_norms = np.where(norms == 0, 1.0, norms)
+        normalized_embeddings = (embeddings / safe_norms).astype(np.float32)
+
+        st.session_state["__embeddings_raw"] = embeddings
+        st.session_state["__embeddings"] = normalized_embeddings
         st.session_state["__doc_ids"] = doc_ids
         st.session_state["__store"] = store
         st.session_state["__embedder_name"] = model_name
