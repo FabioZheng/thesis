@@ -5,6 +5,7 @@ import math
 from peft import get_peft_model, LoraConfig, TaskType
 import os
 from metrics import batch_entropy
+import logging
 
 
 def freeze_model(model):
@@ -316,6 +317,8 @@ class COCOM(PreTrainedModel):
         # first flatten the contexts
         self.generation_top_k = len(contexts[0])
         flat_contexts = sum(contexts, [])
+        tokenized_contexts = flat_contexts
+
         # tokenize the contexts, depending if compr exist or not
         if self.compr is not None:
             enc_input = self.compr.tokenizer(
@@ -323,15 +326,26 @@ class COCOM(PreTrainedModel):
                 padding=True,
                 truncation=True,
                 return_tensors='pt',
-                pad_to_multiple_of=self.current_rate
+                pad_to_multiple_of=self.current_rate,
+                return_overflowing_tokens=True,
+                return_length=True
             )
+            self._warn_on_truncation(enc_input, tokenized_contexts, contexts, self.compr.tokenizer)
             num_mem_tokens = math.ceil(enc_input['input_ids'].size(1) / self.current_rate)
         else:
             # first need to add special token in flat_contexts
-            flat_contexts = [
+            tokenized_contexts = [
                 self.decoder_tokenizer.enc_token + self.decoder_tokenizer.bos_token + context + self.decoder_tokenizer.bos_token
                 for context in flat_contexts]
-            enc_input = self.decoder_tokenizer(flat_contexts, truncation=True, return_tensors='pt', padding="longest")
+            enc_input = self.decoder_tokenizer(
+                tokenized_contexts,
+                truncation=True,
+                return_tensors='pt',
+                padding="longest",
+                return_overflowing_tokens=True,
+                return_length=True,
+            )
+            self._warn_on_truncation(enc_input, tokenized_contexts, contexts, self.decoder_tokenizer)
             num_mem_tokens = math.ceil((enc_input['input_ids'].size(1) - 3) / self.current_rate)
             mem_tokens = torch.full((enc_input['input_ids'].size(0), num_mem_tokens),
                                     self.decoder_tokenizer.mem_token_id, dtype=torch.long)
@@ -357,3 +371,80 @@ class COCOM(PreTrainedModel):
         }
 
         return self.generate(model_input, max_new_tokens)
+
+    def _warn_on_truncation(self, tokenized_inputs, tokenized_contexts, original_contexts, tokenizer):
+        """Emit warnings when tokenization truncates any contexts."""
+        if not original_contexts:
+            return
+
+        contexts_per_question = len(original_contexts[0])
+        if contexts_per_question == 0:
+            return
+
+        def _to_list(values):
+            if values is None:
+                return None
+            if isinstance(values, torch.Tensor):
+                return values.tolist()
+            return list(values)
+
+        lengths = _to_list(tokenized_inputs.get("length")) or []
+        truncated_counts = [0] * len(tokenized_contexts)
+
+        num_truncated_tokens = _to_list(tokenized_inputs.get("num_truncated_tokens"))
+        if num_truncated_tokens is not None:
+            for idx, value in enumerate(num_truncated_tokens[:len(truncated_counts)]):
+                truncated_counts[idx] = int(value)
+        else:
+            overflowing_tokens = tokenized_inputs.get("overflowing_tokens")
+            overflow_to_sample = _to_list(tokenized_inputs.get("overflow_to_sample_mapping"))
+            if overflowing_tokens is not None:
+                if overflow_to_sample is None:
+                    overflow_to_sample = list(range(len(overflowing_tokens)))
+                for overflow_idx, sample_idx in enumerate(overflow_to_sample):
+                    index = int(sample_idx)
+                    if index >= len(truncated_counts):
+                        continue
+                    overflow_entry = overflowing_tokens[overflow_idx]
+                    if isinstance(overflow_entry, torch.Tensor):
+                        overflow_len = int(overflow_entry.numel())
+                    elif isinstance(overflow_entry, list):
+                        overflow_len = len(overflow_entry)
+                    else:
+                        overflow_len = len(overflow_entry)
+                    truncated_counts[index] += overflow_len
+
+        max_model_length = getattr(tokenizer, "model_max_length", None)
+        if isinstance(max_model_length, int) and 0 < max_model_length < 10 ** 6:
+            for idx in range(len(truncated_counts)):
+                if idx < len(lengths) and lengths[idx] >= max_model_length and truncated_counts[idx] == 0:
+                    try:
+                        tokenized = tokenizer(
+                            tokenized_contexts[idx],
+                            truncation=False,
+                            padding=False,
+                            return_attention_mask=False,
+                            add_special_tokens=True,
+                        )
+                    except TypeError:
+                        tokenized = tokenizer(
+                            tokenized_contexts[idx],
+                            truncation=False,
+                            padding=False,
+                        )
+                    full_ids = tokenized.get("input_ids", [])
+                    full_length = len(full_ids)
+                    dropped = max(0, full_length - lengths[idx])
+                    truncated_counts[idx] += dropped
+
+        for flat_idx, dropped in enumerate(truncated_counts):
+            if dropped <= 0:
+                continue
+            question_idx = flat_idx // contexts_per_question
+            context_idx = flat_idx % contexts_per_question
+            logging.warning(
+                "Context (%d, %d) truncated by %d tokens",
+                question_idx,
+                context_idx,
+                dropped,
+            )
