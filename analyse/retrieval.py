@@ -334,11 +334,24 @@ def render_embeddings_block(
         norm_mean = float(norms.mean()) if len(norms) else 0.0
         norm_std = float(norms.std(ddof=1)) if len(norms) > 1 else 0.0
 
-        # 5) per-dimension standard deviation (before normalization)
-        if embeddings.size and len(embeddings) > 1:
-            dim_std = embeddings.std(axis=0, ddof=1)
+        # 5) cosine similarity distribution (using normalized embeddings)
+        cos_sim_values: np.ndarray
+        if len(embeddings_norm) > 1:
+            max_pairs_sample = 2000
+            if len(embeddings_norm) > max_pairs_sample:
+                rng = np.random.default_rng(42)
+                sample_idx = rng.choice(
+                    len(embeddings_norm), size=max_pairs_sample, replace=False
+                )
+                emb_for_cos = embeddings_norm[sample_idx]
+            else:
+                emb_for_cos = embeddings_norm
+
+            cos_matrix = emb_for_cos @ emb_for_cos.T
+            triu_idx = np.triu_indices(emb_for_cos.shape[0], k=1)
+            cos_sim_values = cos_matrix[triu_idx]
         else:
-            dim_std = np.zeros(embeddings.shape[1], dtype=np.float32)
+            cos_sim_values = np.array([], dtype=np.float32)
 
         # 6) pickle disk size for embeddings ndarray
         tmp_pkl = "embeddings_tmp.pkl"
@@ -372,12 +385,35 @@ def render_embeddings_block(
             st.metric("Embedding norm σ", f"{norm_std:.4f}", delta=f"μ={norm_mean:.4f}")
         st.caption("Norm statistics computed from raw embeddings prior to L2 normalization.")
 
-        with st.expander("Per-dimension standard deviation (raw embeddings)"):
-            dim_std_df = pd.DataFrame({
-                "dimension": np.arange(dim_std.shape[0]),
-                "std": dim_std,
-            })
-            st.dataframe(dim_std_df)
+        with st.expander("Cosine similarity distribution (normalized embeddings)"):
+            if cos_sim_values.size:
+                cos_df = pd.DataFrame({"cosine_similarity": cos_sim_values})
+                cos_mean = float(cos_sim_values.mean())
+                cos_std = (
+                    float(cos_sim_values.std(ddof=1))
+                    if cos_sim_values.size > 1
+                    else 0.0
+                )
+                st.write(
+                    "Sampled pairwise cosine similarities across the corpus (using "
+                    "L2-normalized embeddings)."
+                )
+                st.metric(
+                    "Mean ± σ",
+                    f"{cos_mean:.4f} ± {cos_std:.4f}",
+                )
+                st.metric(
+                    "Min / Max",
+                    f"{cos_sim_values.min():.4f} / {cos_sim_values.max():.4f}",
+                )
+                hist_fig = px.histogram(cos_df, x="cosine_similarity", nbins=40)
+                hist_fig.update_layout(
+                    title="Pairwise Cosine Similarity Distribution",
+                    bargap=0.05,
+                )
+                st.plotly_chart(hist_fig, use_container_width=True)
+            else:
+                st.info("Need at least two documents to compute cosine similarities.")
 
         # Scatter (PCA)
         fig = plot_embeddings_pca(embeddings, doc_ids, sample=1000)
