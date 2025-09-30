@@ -4,6 +4,8 @@ datasets
 flash-attn
 matplotlib
 numpy
+h5py
+faiss-cpu
 peft
 pyserini
 regex
