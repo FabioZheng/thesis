@@ -23,6 +23,7 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         help="Path to a trained COCOM checkpoint directory for context generation",
     )
+    parser.add_argument("--limit", type=int, help="Max number of rows", default=None)
     parser.add_argument("--compression_rate", type=int, help="Fallback rate", default=4)
     parser.add_argument("--docs_out", help="Directory to save flattened documents", default="data")
     parser.add_argument("--contexts_out", help="Directory to save compressed contexts", default="data/contexts")
@@ -166,7 +167,7 @@ def generate_embeddings(
 def main() -> None:
     args = parse_args()
 
-    docs = load_and_flatten(args.dataset)
+    docs = load_and_flatten(args.dataset, limit=args.limit)
     docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
     print(
         "Extracted {count} MS MARCO passages -> {path} "

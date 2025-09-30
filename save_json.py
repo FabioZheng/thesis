@@ -13,6 +13,7 @@ import json
 import os
 import pickle
 import sys
+from itertools import islice
 from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple, Union
 
 import pandas as pd
@@ -219,6 +220,7 @@ def load_and_flatten(
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
+    limit: int | None = None,
 ) -> Dict[int, Dict[str, Union[str, int, float, None]]]:
     """Load a dataset-like object and flatten it into doc-indexed records.
 
@@ -227,7 +229,9 @@ def load_and_flatten(
     dataset on the Hugging Face Hub, or any iterable of mapping-like rows. When
     ``dataset_source`` is a Hugging Face dataset identifier the optional
     ``split``, ``name`` and ``load_dataset_kwargs`` arguments are forwarded to
-    :func:`datasets.load_dataset`.
+    :func:`datasets.load_dataset`. The optional ``limit`` argument constrains the
+    number of rows that will be consumed from ``dataset_source`` before
+    flattening passages.
     """
 
     if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
@@ -246,10 +250,16 @@ def load_and_flatten(
                 f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
             ) from error
 
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+
     docs: Dict[int, Dict[str, Union[str, int, float, None]]] = {}
     doc_id = 0
 
     row_iterable = _iter_rows(dataset_source)
+    if limit is not None:
+        row_iterable = islice(row_iterable, limit)
+
     for row in tqdm(row_iterable, desc="Flattening dataset", unit="row"):
         query_id = _extract_query_id(row)
         passage_texts = _extract_passage_texts(row)
@@ -465,6 +475,12 @@ def main() -> None:
         default="data/queries.json",
         help="Optional path to persist query_id to query text mapping as JSON",
     )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optionally limit the number of rows to process when flattening",
+    )
 
     args = parser.parse_args()
 
@@ -472,7 +488,7 @@ def main() -> None:
     dataset = load_dataset(args.dataset, split=args.split, name=args.name)
 
     print("🧹 Flattening dataset structure")
-    docs = load_and_flatten(dataset, split=args.split, name=args.name)
+    docs = load_and_flatten(dataset, split=args.split, name=args.name, limit=args.limit)
 
     out_file = args.out or f"{args.dataset.replace('/', '_')}_{args.split}_flattened.json"
     path, mem_stats = save_json_to_path(docs, out_file)
