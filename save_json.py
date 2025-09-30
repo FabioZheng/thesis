@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, Mapping, MutableMapping, Sequence, Tuple
 
 import pandas as pd
 from datasets import Dataset, DatasetDict, IterableDataset, load_dataset
+from tqdm import tqdm
 
 
 TEXT_CONTAINER_KEYS: Sequence[str] = (
@@ -248,7 +249,8 @@ def load_and_flatten(
     docs: Dict[int, Dict[str, Union[str, int, float, None]]] = {}
     doc_id = 0
 
-    for row in _iter_rows(dataset_source):
+    row_iterable = _iter_rows(dataset_source)
+    for row in tqdm(row_iterable, desc="Flattening dataset", unit="row"):
         query_id = _extract_query_id(row)
         passage_texts = _extract_passage_texts(row)
         if not passage_texts and "text" in row:
