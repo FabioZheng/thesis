@@ -3,6 +3,7 @@ import os
 import math
 import pickle
 import json
+import time
 import matplotlib.pyplot as plt
 from rouge import Rouge
 import datasets
@@ -91,6 +92,12 @@ def get_args():
     parser.add_argument("--r_gamma", type=float, default=0.1, help="γ weight for 1/compression_rate penalty")
     parser.add_argument("--bertscore_lang", type=str, default="en", help="Language or model for BERTScore")
     parser.add_argument("--bertscore_rescale", action="store_true", help="Rescale BERTScore with baseline")
+    parser.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=0,
+        help="Save the bandit agent every N training examples (0 disables periodic saves)",
+    )
     return parser.parse_args()
 
 
@@ -157,6 +164,9 @@ def main():
     # Initialize bandit agent
     agent = CompressionBanditAgent(model.compr_rates, alpha=args.alpha)
     model.set_bandit_agent(agent)
+
+    os.makedirs(args.output_dir, exist_ok=True)
+    save_log_path = os.path.join(args.output_dir, "save_log.jsonl")
 
     # Load and prepare dataset
     if os.path.exists(args.dataset_name_or_dir):
@@ -271,6 +281,46 @@ def main():
             rate_reward_cnt[chosen_rate] += 1
             total_examples += 1
 
+            if args.save_every_steps and total_examples % args.save_every_steps == 0:
+                checkpoint_path = os.path.join(args.output_dir, "bandit_agent.pkl")
+                agent_data = {
+                    "A": agent.A,
+                    "b": agent.b,
+                    "rates": agent.rates,
+                    "alpha": agent.alpha,
+                    "training_info": {
+                        "num_examples": args.num_examples,
+                        "doc_max_length": args.doc_max_length,
+                        "dataset": args.dataset_name_or_dir,
+                        "model_checkpoint": args.checkpoint,
+                        "examples_seen": total_examples,
+                    },
+                }
+
+                with open(checkpoint_path, "wb") as f:
+                    pickle.dump(agent_data, f)
+
+                avg_reward_all = sum(rate_reward_sum.values()) / max(1, total_examples)
+                selection_counts = {str(r): count for r, count in rate_reward_cnt.items()}
+
+                log_entry = {
+                    "timestamp": time.time(),
+                    "examples_seen": total_examples,
+                    "checkpoint": checkpoint_path,
+                    "avg_reward": avg_reward_all,
+                    "selection_counts": selection_counts,
+                }
+                with open(save_log_path, "a") as log_file:
+                    log_file.write(json.dumps(log_entry) + "\n")
+
+                counts_str = " | ".join(
+                    [f"rate {rate}: {selection_counts[str(rate)]}" for rate in model.compr_rates]
+                )
+                print(
+                    f"💾 Saved intermediate agent checkpoint at {checkpoint_path} after {total_examples} examples\n"
+                    f"   ↳ avg reward: {avg_reward_all:.4f} | selections → {counts_str}"
+                )
+
         # Progress log: average reward and selection counts
         if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
             filled = {
@@ -303,9 +353,6 @@ def main():
         agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time:contentReference[oaicite:1]{index=1}
 
     # Save trained agent
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    # Save agent state
     agent_data = {
         "A": agent.A,
         "b": agent.b,
@@ -315,12 +362,28 @@ def main():
             "num_examples": args.num_examples,
             "doc_max_length": args.doc_max_length,
             "dataset": args.dataset_name_or_dir,
-            "model_checkpoint": args.checkpoint
+            "model_checkpoint": args.checkpoint,
+            "examples_seen": total_examples,
         }
     }
 
-    with open(os.path.join(args.output_dir, "bandit_agent.pkl"), "wb") as f:
+    final_checkpoint_path = os.path.join(args.output_dir, "bandit_agent.pkl")
+    with open(final_checkpoint_path, "wb") as f:
         pickle.dump(agent_data, f)
+
+    final_avg_reward = sum(rate_reward_sum.values()) / max(1, total_examples)
+    final_selection_counts = {str(r): count for r, count in rate_reward_cnt.items()}
+
+    log_entry = {
+        "timestamp": time.time(),
+        "examples_seen": total_examples,
+        "checkpoint": final_checkpoint_path,
+        "avg_reward": final_avg_reward,
+        "selection_counts": final_selection_counts,
+        "final": True,
+    }
+    with open(save_log_path, "a") as log_file:
+        log_file.write(json.dumps(log_entry) + "\n")
 
     # Save rewards history
     with open(os.path.join(args.output_dir, "rewards_history.json"), "w") as f:
@@ -346,6 +409,13 @@ def main():
 
     print(f"\n✅ Bandit training completed!")
     print(f"📁 Agent saved to: {args.output_dir}/bandit_agent.pkl")
+    print(f"📝 Save log: {save_log_path}")
+    counts_str = " | ".join(
+        [f"rate {rate}: {final_selection_counts[str(rate)]}" for rate in model.compr_rates]
+    )
+    print(
+        f"   ↳ final avg reward: {final_avg_reward:.4f} | selections → {counts_str}"
+    )
     wandb.finish()
 
 
