@@ -321,24 +321,10 @@ def main():
                     f"   ↳ avg reward: {avg_reward_all:.4f} | selections → {counts_str}"
                 )
 
-        # Progress log: average reward and selection counts
-        if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
-            filled = {
-                r: (rate_reward_sum[r] / max(1, rate_reward_cnt[r]))
-                for r in model.compr_rates if rate_reward_cnt[r] > 0
-            }
-            avg_recent = np.mean(list(filled.values())) if filled else 0.0
-            print(f"  Batch {batch_idx + 1}/{len(loader)}: avg reward = {avg_recent:.4f}")
-
-            # Print selection counts for each rate
-            counts_str = " | ".join([f"rate {r}: {rate_reward_cnt[r]}" for r in model.compr_rates])
-            print(f"    Selections so far → {counts_str}")
-
-            # Log metrics to Weights & Biases
-            log_data = {"avg_reward": avg_recent}
-            for r in model.compr_rates:
-                log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
-            wandb.log(log_data)
+                log_data = {"avg_reward": avg_reward_all, "examples_seen": total_examples}
+                for r in model.compr_rates:
+                    log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
+                wandb.log(log_data)
 
 
     # Summarize per-rate averages
@@ -416,6 +402,10 @@ def main():
     print(
         f"   ↳ final avg reward: {final_avg_reward:.4f} | selections → {counts_str}"
     )
+    final_log_data = {"avg_reward": final_avg_reward, "examples_seen": total_examples}
+    for r in model.compr_rates:
+        final_log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
+    wandb.log(final_log_data)
     wandb.finish()
 
 
