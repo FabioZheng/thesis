@@ -3,6 +3,7 @@ import os
 import math
 import pickle
 import json
+from datetime import datetime
 import matplotlib.pyplot as plt
 from rouge import Rouge
 import datasets
@@ -97,6 +98,7 @@ def get_args():
     parser.add_argument("--bertscore_lang", type=str, default="en", help="Language or model for BERTScore")
     parser.add_argument("--bertscore_rescale", action="store_true", help="Rescale BERTScore with baseline")
     parser.add_argument("--display_every", type=int, default=100, help="Frequency (in examples) to display reconstruction samples")
+    parser.add_argument("--save_every", type=int, default=0, help="Save the bandit agent every N examples (0 disables periodic saves)")
     return parser.parse_args()
 
 
@@ -148,6 +150,94 @@ def prepare_dataset(dataset, dataset_name):
     return dataset
 
 
+def append_progress_log(output_dir, step, avg_reward, selection_counts):
+    os.makedirs(output_dir, exist_ok=True)
+    log_path = os.path.join(output_dir, "progress_log.jsonl")
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "step": step,
+        "avg_reward": avg_reward,
+        "selection_counts": selection_counts,
+    }
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(log_entry) + "\n")
+
+
+def summarize_progress(model, rate_reward_sum, rate_reward_cnt):
+    filled = {
+        r: (rate_reward_sum[r] / max(1, rate_reward_cnt[r]))
+        for r in model.compr_rates
+        if rate_reward_cnt[r] > 0
+    }
+    avg_recent = np.mean(list(filled.values())) if filled else 0.0
+    selection_counts = {str(r): rate_reward_cnt[r] for r in model.compr_rates}
+    return avg_recent, selection_counts
+
+
+def record_progress(output_dir, model, rate_reward_sum, rate_reward_cnt, step):
+    avg_recent, selection_counts = summarize_progress(
+        model,
+        rate_reward_sum,
+        rate_reward_cnt,
+    )
+
+    print(f"  Examples processed: {step} | avg reward = {avg_recent:.4f}")
+
+    counts_str = " | ".join([
+        f"rate {r}: {selection_counts[str(r)]}" for r in model.compr_rates
+    ])
+    print(f"    Selections so far → {counts_str}")
+
+    append_progress_log(
+        output_dir,
+        step,
+        avg_recent,
+        selection_counts,
+    )
+
+    log_data = {"avg_reward": avg_recent}
+    for r in model.compr_rates:
+        log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
+    wandb.log(log_data)
+
+
+def save_agent_state(agent, output_dir, args, model_source, step, note="periodic"):
+    os.makedirs(output_dir, exist_ok=True)
+
+    agent_data = {
+        "A": agent.A,
+        "b": agent.b,
+        "rates": agent.rates,
+        "alpha": agent.alpha,
+        "training_info": {
+            "num_examples": args.num_examples,
+            "doc_max_length": args.doc_max_length,
+            "dataset": args.dataset_name_or_dir,
+            "model_checkpoint": args.checkpoint,
+            "model_source": model_source,
+            "last_saved_step": step,
+        },
+    }
+
+    save_path = os.path.join(output_dir, "bandit_agent.pkl")
+    with open(save_path, "wb") as f:
+        pickle.dump(agent_data, f)
+
+    log_entry = {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "step": step,
+        "save_path": save_path,
+        "note": note,
+    }
+    log_path = os.path.join(output_dir, "save_log.jsonl")
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        log_file.write(json.dumps(log_entry) + "\n")
+
+    print(
+        f"💾 Saved bandit agent at step {step} to {save_path} (log updated at {log_path})"
+    )
+
+
 def main():
     args = get_args()
     wandb.init(project="COCOM CMAB", config=vars(args))
@@ -184,6 +274,9 @@ def main():
 
     # Prepare dataset for consistent format
     dataset = prepare_dataset(dataset, args.dataset_name_or_dir)
+
+    # Ensure output directory exists for logs and checkpoints
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Training data for bandit
     rewards_history = []
@@ -222,6 +315,7 @@ def main():
     rate_reward_cnt = {r: 0 for r in model.compr_rates}
 
     total_examples = 0
+    last_logged_step = 0
     for batch_idx, batch in enumerate(loader):
         texts = batch.pop("text")
         # Compute contexts (entropy) on CPU tensors expected by batch_entropy
@@ -284,24 +378,23 @@ def main():
                 print(f"Original    : {gold}")
                 print(f"Reconstructed: {pred}\n")
 
-        # Progress log: average reward and selection counts
-        if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
-            filled = {
-                r: (rate_reward_sum[r] / max(1, rate_reward_cnt[r]))
-                for r in model.compr_rates if rate_reward_cnt[r] > 0
-            }
-            avg_recent = np.mean(list(filled.values())) if filled else 0.0
-            print(f"  Batch {batch_idx + 1}/{len(loader)}: avg reward = {avg_recent:.4f}")
-
-            # Print selection counts for each rate
-            counts_str = " | ".join([f"rate {r}: {rate_reward_cnt[r]}" for r in model.compr_rates])
-            print(f"    Selections so far → {counts_str}")
-
-            # Log metrics to Weights & Biases
-            log_data = {"avg_reward": avg_recent}
-            for r in model.compr_rates:
-                log_data[f"selections_rate_{r}"] = rate_reward_cnt[r]
-            wandb.log(log_data)
+            if args.save_every > 0 and total_examples % args.save_every == 0:
+                record_progress(
+                    args.output_dir,
+                    model,
+                    rate_reward_sum,
+                    rate_reward_cnt,
+                    total_examples,
+                )
+                last_logged_step = total_examples
+                save_agent_state(
+                    agent,
+                    args.output_dir,
+                    args,
+                    model_source,
+                    total_examples,
+                    note="periodic",
+                )
 
 
     # Summarize per-rate averages
@@ -315,26 +408,25 @@ def main():
     model.set_bandit_agent(
         agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time
 
-    # Save trained agent
-    os.makedirs(args.output_dir, exist_ok=True)
+    if total_examples > 0 and total_examples != last_logged_step:
+        record_progress(
+            args.output_dir,
+            model,
+            rate_reward_sum,
+            rate_reward_cnt,
+            total_examples,
+        )
+        last_logged_step = total_examples
 
-    # Save agent state
-    agent_data = {
-        "A": agent.A,
-        "b": agent.b,
-        "rates": agent.rates,
-        "alpha": agent.alpha,
-        "training_info": {
-            "num_examples": args.num_examples,
-            "doc_max_length": args.doc_max_length,
-            "dataset": args.dataset_name_or_dir,
-            "model_checkpoint": args.checkpoint,
-            "model_source": model_source
-        }
-    }
-
-    with open(os.path.join(args.output_dir, "bandit_agent.pkl"), "wb") as f:
-        pickle.dump(agent_data, f)
+    # Save trained agent (final save)
+    save_agent_state(
+        agent,
+        args.output_dir,
+        args,
+        model_source,
+        total_examples,
+        note="final",
+    )
 
     # Save rewards history
     with open(os.path.join(args.output_dir, "rewards_history.json"), "w") as f:
