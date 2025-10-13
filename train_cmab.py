@@ -209,6 +209,7 @@ def save_agent_state(agent, output_dir, args, model_source, step, note="periodic
         "b": agent.b,
         "rates": agent.rates,
         "alpha": agent.alpha,
+        "feature_dim": agent.feature_dim,
         "training_info": {
             "num_examples": args.num_examples,
             "doc_max_length": args.doc_max_length,
@@ -320,25 +321,37 @@ def main():
         texts = batch.pop("text")
         # Compute contexts (entropy) on CPU tensors expected by batch_entropy
         entropies = batch_entropy(batch["enc_input_ids"], batch["enc_attention_mask"])
+        lengths = batch["enc_attention_mask"].sum(dim=1)
+        seq_len = batch["enc_attention_mask"].size(1)
+        norm_factor = max(int(seq_len), 1)
+        doc_lengths = (lengths.float() / norm_factor).cpu().numpy().tolist()
 
         ent_arr = np.asarray(entropies, dtype=float)
         ent_min = float(ent_arr.min()) if ent_arr.size else float('nan')
         ent_max = float(ent_arr.max()) if ent_arr.size else float('nan')
         ent_mean = float(ent_arr.mean()) if ent_arr.size else float('nan')
         ent_std = float(ent_arr.std(ddof=0)) if ent_arr.size else float('nan')
+        len_arr = np.asarray(doc_lengths, dtype=float)
+        len_min = float(len_arr.min()) if len_arr.size else float('nan')
+        len_max = float(len_arr.max()) if len_arr.size else float('nan')
+        len_mean = float(len_arr.mean()) if len_arr.size else float('nan')
+        len_std = float(len_arr.std(ddof=0)) if len_arr.size else float('nan')
         print(
             f"Batch {batch_idx + 1}/{len(loader)} | "
             f"entropy min={ent_min:.4f}, max={ent_max:.4f}, "
-            f"avg={ent_mean:.4f}, std={ent_std:.4f}"
+            f"avg={ent_mean:.4f}, std={ent_std:.4f} | "
+            f"len min={len_min:.4f}, max={len_max:.4f}, "
+            f"avg={len_mean:.4f}, std={len_std:.4f}"
         )
 
         B = len(texts)
 
         # Process each example independently: select → play → update
         for i in range(B):
-            x = float(entropies[i])  # context feature (entropy); if you use d>1 features, pass a vector
+            x = float(entropies[i])  # entropy feature
+            doc_len = float(doc_lengths[i])  # normalized length feature
             # UCB arm selection (uses A_a, b_a, alpha inside the agent)
-            chosen_rate = agent.select_rate(x)
+            chosen_rate = agent.select_rate(x, doc_len)
 
             # Build a single-example sub-batch
             ex = {
@@ -365,7 +378,7 @@ def main():
             r = args.r_alpha * bertscore_f1 + args.r_beta * rouge_l - args.r_gamma * compression_penalty
 
             # Online update ONLY the chosen arm with (x, r)
-            agent.update(x, chosen_rate, r)
+            agent.update(x, doc_len, chosen_rate, r)
 
             # Accounting
             rate_reward_sum[chosen_rate] += r
@@ -406,7 +419,7 @@ def main():
 
     # Now attach the trained bandit for inference-time selection inside COCOM.generate()
     model.set_bandit_agent(
-        agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time
+        agent)  # COCOM will call agent.select_rate(...) based on entropy & length at generation time
 
     if total_examples > 0 and total_examples != last_logged_step:
         record_progress(

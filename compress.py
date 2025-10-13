@@ -4,6 +4,7 @@ import pickle
 from typing import Any, Dict, List, Optional
 
 import torch
+import numpy as np
 
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
@@ -62,13 +63,28 @@ def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
 
     agent_rates = agent_data.get("rates", rates)
     agent_alpha = agent_data.get("alpha", 1.0)
-    agent = CompressionBanditAgent(agent_rates, alpha=agent_alpha)
+    feature_dim = agent_data.get("feature_dim")
+    if feature_dim is None and "A" in agent_data and agent_data["A"]:
+        first_matrix = next(iter(agent_data["A"].values()))
+        feature_dim = first_matrix.shape[0]
+    if feature_dim is None:
+        feature_dim = 2
+
+    agent = CompressionBanditAgent(agent_rates, alpha=agent_alpha, feature_dim=feature_dim)
 
     # Restore learned parameters if available
     if "A" in agent_data:
-        agent.A = agent_data["A"]
+        agent.A = {rate: np.array(mat) for rate, mat in agent_data["A"].items()}
     if "b" in agent_data:
-        agent.b = agent_data["b"]
+        agent.b = {rate: np.array(vec) for rate, vec in agent_data["b"].items()}
+
+    # Ensure matrices match configured feature dimensionality
+    for rate in agent.rates:
+        A = agent.A.get(rate)
+        b = agent.b.get(rate)
+        if A is None or b is None or A.shape != (agent.feature_dim, agent.feature_dim) or b.shape != (agent.feature_dim, 1):
+            agent.A[rate] = np.identity(agent.feature_dim)
+            agent.b[rate] = np.zeros((agent.feature_dim, 1))
 
     return agent
 
@@ -100,10 +116,13 @@ def generate_contexts(
         )
         selected_rate = fallback_rate
         entropy: Optional[float] = None
+        doc_length_ratio: Optional[float] = None
         if agent is not None:
             entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
+            attn_mask = tokens["attention_mask"]
+            doc_length_ratio = float(attn_mask.sum().item()) / max(attn_mask.size(-1), 1)
             try:
-                selected_rate = agent.select_rate(float(entropy))
+                selected_rate = agent.select_rate(float(entropy), float(doc_length_ratio))
             except Exception:
                 selected_rate = fallback_rate
 
@@ -130,9 +149,11 @@ def generate_contexts(
         }
         if entropy is not None:
             contexts[doc_id]["entropy"] = entropy
+        if doc_length_ratio is not None:
+            contexts[doc_id]["normalized_length"] = doc_length_ratio
 
         # Update progress description
-        pbar.set_postfix({"rate": selected_rate, "entropy": entropy})
+        pbar.set_postfix({"rate": selected_rate, "entropy": entropy, "len": doc_length_ratio})
 
     return contexts
 
