@@ -28,26 +28,27 @@ def collate_batch(batch):
     return ret
 
 
-def load_model_safely(checkpoint_path):
+def load_model_safely(model_source):
     """
     Load COCOM model with enhanced error handling and compatibility checks
     """
-    print(f"Loading model from: {checkpoint_path}")
+    print(f"Loading model from: {model_source}")
 
-    # Check if checkpoint exists
-    if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    is_local_path = os.path.exists(model_source)
+    if not is_local_path:
+        print("Checkpoint not found locally. Attempting to load from the Hugging Face Hub...")
 
     # Check for metadata file
-    metadata_path = os.path.join(checkpoint_path, 'cmab_metadata.json')
-    if os.path.exists(metadata_path):
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        print(f"Found CMAB metadata: {metadata}")
+    if is_local_path:
+        metadata_path = os.path.join(model_source, 'cmab_metadata.json')
+        if os.path.exists(metadata_path):
+            with open(metadata_path, 'r') as f:
+                metadata = json.load(f)
+            print(f"Found CMAB metadata: {metadata}")
 
     try:
         # Load the model
-        model = COCOM.from_pretrained(checkpoint_path, trust_remote_code=True)
+        model = COCOM.from_pretrained(model_source, trust_remote_code=True)
 
         # Ensure current_rate is set for compatibility
         if not hasattr(model, 'current_rate') or model.current_rate is None:
@@ -63,13 +64,16 @@ def load_model_safely(checkpoint_path):
         print(f"Error loading model: {e}")
         print("Attempting to load with alternative method...")
 
-        # Alternative loading method
+        # Alternative loading method (local checkpoints only)
+        if not is_local_path:
+            raise Exception("Could not load model from Hugging Face Hub") from e
+
         from modeling_cocom import COCOMConfig
-        config_path = os.path.join(checkpoint_path, 'config.json')
+        config_path = os.path.join(model_source, 'config.json')
         if os.path.exists(config_path):
-            config = COCOMConfig.from_pretrained(checkpoint_path)
+            config = COCOMConfig.from_pretrained(model_source)
             model = COCOM(config)
-            model.load_state_dict(torch.load(os.path.join(checkpoint_path, 'pytorch_model.bin')))
+            model.load_state_dict(torch.load(os.path.join(model_source, 'pytorch_model.bin')))
             model.current_rate = model.compr_rates[0]
             return model
         else:
@@ -78,7 +82,8 @@ def load_model_safely(checkpoint_path):
 
 def get_args():
     parser = argparse.ArgumentParser(description="Train contextual bandit for compression rate selection")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to trained COCOM checkpoint")
+    parser.add_argument("--checkpoint", type=str, default=None, help="Path to trained COCOM checkpoint")
+    parser.add_argument("--hf_model_name", type=str, default=None, help="Hugging Face model id to load instead of a local checkpoint")
     parser.add_argument("--dataset_name_or_dir", type=str, default="ms_marco", help="HF dataset or local path")
     parser.add_argument("--doc_max_length", type=int, default=128, help="Maximum document length")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
@@ -91,6 +96,7 @@ def get_args():
     parser.add_argument("--r_gamma", type=float, default=0.1, help="γ weight for 1/compression_rate penalty")
     parser.add_argument("--bertscore_lang", type=str, default="en", help="Language or model for BERTScore")
     parser.add_argument("--bertscore_rescale", action="store_true", help="Rescale BERTScore with baseline")
+    parser.add_argument("--display_every", type=int, default=100, help="Frequency (in examples) to display reconstruction samples")
     return parser.parse_args()
 
 
@@ -100,7 +106,7 @@ def prepare_dataset(dataset, dataset_name):
     """
     print(f"Preparing dataset: {dataset_name}")
     print(f"Original columns: {dataset.column_names}")
-    print(f"Sample data: {dataset[:2]}")
+    #print(f"Sample data: {dataset[:2]}")
 
     # Handle different dataset formats
     if "passages" in dataset.column_names:
@@ -148,7 +154,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Load model with enhanced error handling
-    model = load_model_safely(args.checkpoint)
+    model_source = args.hf_model_name if args.hf_model_name else args.checkpoint
+    model = load_model_safely(model_source)
     model = model.to(device)
     model.eval()
 
@@ -261,7 +268,7 @@ def main():
             _, _, f1 = bert_scorer.score([pred], [gold])  # returns tensors
             bertscore_f1 = float(f1.mean().item())
             compression_penalty = 1.0 / float(chosen_rate)
-            r = args.r_beta * rouge_l - args.r_gamma * compression_penalty
+            r = args.r_alpha * bertscore_f1 + args.r_beta * rouge_l - args.r_gamma * compression_penalty
 
             # Online update ONLY the chosen arm with (x, r)
             agent.update(x, chosen_rate, r)
@@ -270,6 +277,12 @@ def main():
             rate_reward_sum[chosen_rate] += r
             rate_reward_cnt[chosen_rate] += 1
             total_examples += 1
+
+            if args.display_every > 0 and total_examples % args.display_every == 0:
+                print("\n🔍 Autoencoding quality check")
+                print(f"Example #{total_examples} | Compression rate: {chosen_rate}")
+                print(f"Original    : {gold}")
+                print(f"Reconstructed: {pred}\n")
 
         # Progress log: average reward and selection counts
         if (batch_idx + 1) % max(1, len(loader) // 10) == 0:
@@ -300,7 +313,7 @@ def main():
 
     # Now attach the trained bandit for inference-time selection inside COCOM.generate()
     model.set_bandit_agent(
-        agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time:contentReference[oaicite:1]{index=1}
+        agent)  # COCOM will call agent.select_rate(...) based on entropy at generation time
 
     # Save trained agent
     os.makedirs(args.output_dir, exist_ok=True)
@@ -315,7 +328,8 @@ def main():
             "num_examples": args.num_examples,
             "doc_max_length": args.doc_max_length,
             "dataset": args.dataset_name_or_dir,
-            "model_checkpoint": args.checkpoint
+            "model_checkpoint": args.checkpoint,
+            "model_source": model_source
         }
     }
 
