@@ -476,6 +476,10 @@ class RAGDataCollator:
 
 
 class FineTuningTrainer(Trainer):
+    def __init__(self, *args, save_only_final: bool = True, **kwargs):
+        self.save_only_final = save_only_final
+        super().__init__(*args, **kwargs)
+
     def training_step(self, model, *args):
         inputs = args[0] if len(args) > 0 else None
         model.train()
@@ -514,6 +518,14 @@ class FineTuningTrainer(Trainer):
             outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         return (loss, outputs) if return_outputs else loss
+
+    def _save_checkpoint(self, model, trial, metrics=None):
+        if not self.save_only_final or self.state.global_step >= self.state.max_steps:
+            super()._save_checkpoint(model, trial, metrics)
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        if not self.save_only_final or self.state.global_step >= self.state.max_steps:
+            super().save_model(output_dir=output_dir, _internal_call=_internal_call)
 
 
 def compute_metrics(eval_pred, model, rouge):
@@ -570,8 +582,9 @@ def main():
     decoder_model_name = cfg.decoder_model_name
 
     folder_name = f"{Hasher.hash(str(args))}"
-    output_dir = f"{args.experiment_folder}/tmp_{folder_name}"
-    model_output_dir = output_dir + "/train/"
+    tmp_output_dir = os.path.join(args.experiment_folder, "finetune_tmp")
+    model_output_dir = os.path.join(tmp_output_dir, "checkpoints")
+    final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
 
     if accelerator.is_main_process:
         run_name = (
@@ -579,6 +592,18 @@ def main():
             f"{lora}_{args.lr}_{folder_name}"
         )
         wandb.init(project="COCOM QA Finetune", name=run_name)
+        if os.path.exists(tmp_output_dir):
+            shutil.rmtree(tmp_output_dir)
+        if os.path.exists(final_model_dir):
+            shutil.rmtree(final_model_dir)
+        os.makedirs(model_output_dir, exist_ok=True)
+        print(f"Temporary outputs: {tmp_output_dir}")
+        print(f"Final model path: {final_model_dir}")
+
+    accelerator.wait_for_everyone()
+
+    if not os.path.exists(model_output_dir):
+        os.makedirs(model_output_dir, exist_ok=True)
 
     context_store = load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
@@ -634,14 +659,15 @@ def main():
         per_device_eval_batch_size=max(args.per_device_batch_size // 4, 1),
         gradient_accumulation_steps=args.gradient_accumulation,
         eval_strategy="steps",
-        save_total_limit=10,
+        save_strategy="no",
         report_to=None,
-        save_strategy="steps",
         warmup_ratio=args.warmup_ratio,
         dataloader_num_workers=4,
         do_eval=True,
         max_grad_norm=1.0,
         remove_unused_columns=False,
+        logging_steps=10,
+        eval_steps=10,
     )
 
     accelerator = Accelerator()
@@ -650,10 +676,6 @@ def main():
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
     steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
     total_steps = steps_per_epoch
-    save_steps = max(total_steps // args.num_save_steps, 1)
-    training_args.save_steps = save_steps
-    training_args.logging_steps = 10
-    training_args.eval_steps = 10
 
     trainer = FineTuningTrainer(
         model=model,
@@ -690,10 +712,10 @@ def main():
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
 
+    config_path = os.path.join(tmp_output_dir, "training_config.json")
     if accelerator.is_main_process:
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-        with open(f"{output_dir}/config.json", "w") as json_file:
+        os.makedirs(tmp_output_dir, exist_ok=True)
+        with open(config_path, "w") as json_file:
             json.dump(vars(args), json_file, indent=4)
 
     trainer.train(resume_from_checkpoint=checkpoint)
@@ -702,9 +724,15 @@ def main():
     unwrapped_model = accelerator.unwrap_model(model)
 
     if accelerator.is_main_process:
-        unwrapped_model.save_pretrained(f"{output_dir}/last_model/")
-        final_output_dir = f"{args.experiment_folder}/{folder_name}"
-        shutil.move(output_dir, final_output_dir)
+        if os.path.exists(final_model_dir):
+            shutil.rmtree(final_model_dir)
+        os.makedirs(final_model_dir, exist_ok=True)
+        unwrapped_model.save_pretrained(final_model_dir)
+        if os.path.exists(config_path):
+            shutil.copy2(config_path, os.path.join(final_model_dir, "training_config.json"))
+        print(f"Saved fine-tuned model to: {final_model_dir}")
+        if os.path.exists(tmp_output_dir):
+            shutil.rmtree(tmp_output_dir)
 
 
 if __name__ == "__main__":
