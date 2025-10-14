@@ -248,6 +248,9 @@ def main():
     args = get_args()
     wandb.init(project="COCOM CMAB", config=vars(args))
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device} (GPU available: {torch.cuda.is_available()})")
+    if device == "cuda":
+        print(f"CUDA device count: {torch.cuda.device_count()}")
 
     # Load model with enhanced error handling
     model_source = args.hf_model_name if args.hf_model_name else args.checkpoint
@@ -258,6 +261,8 @@ def main():
     print(f"Model compression rates: {model.compr_rates}")
 
     # Initialize bandit agent
+    print(f"Length feature enabled: {args.use_length_feature}")
+
     agent = CompressionBanditAgent(
         model.compr_rates,
         alpha=args.alpha,
