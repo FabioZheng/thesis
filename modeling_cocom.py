@@ -260,6 +260,8 @@ class COCOM(PreTrainedModel):
             ptr = 0
             for local_idx, j in enumerate(range(indices[i], indices[i + 1])):
                 current_embs = compressed_embs[j]
+                if current_embs.dtype != inputs_embeds.dtype:
+                    current_embs = current_embs.to(dtype=inputs_embeds.dtype)
                 required = current_embs.size(0)
                 remaining = mem_positions.numel() - ptr
 
