@@ -15,9 +15,8 @@ from transformers import Trainer, TrainingArguments
 from analyse.retrieval import CosineRetriever, TextEmbedder
 from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
-from metrics import compute_rouge_scores, exact_match_score, f1_score
+from metrics import exact_match_score, f1_score
 from modeling_cocom import COCOM, COCOMConfig
-from rouge import Rouge
 from transformers.trainer_utils import get_last_checkpoint
 
 import wandb
@@ -528,7 +527,7 @@ class FineTuningTrainer(Trainer):
             super().save_model(output_dir=output_dir, _internal_call=_internal_call)
 
 
-def compute_metrics(eval_pred, model, rouge):
+def compute_metrics(eval_pred, model):
     logits_list, labels = eval_pred
     if isinstance(logits_list, tuple):
         logits_list = logits_list[0]
@@ -548,18 +547,23 @@ def compute_metrics(eval_pred, model, rouge):
     labels_str = original_model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
     metrics = {}
-    rouge_scores = compute_rouge_scores(rouge, preds_str, labels_str)
     em = exact_match_score(preds_str, labels_str)
     f1 = f1_score(preds_str, labels_str)
-    metrics.update(rouge_scores)
     metrics.update({"EM": em, "F1": f1})
+
+    sample_pairs = list(zip(preds_str, labels_str))
+    if sample_pairs:
+        print("Sample predictions vs references:")
+        for index, (prediction, reference) in enumerate(sample_pairs[:3]):
+            print(f"[{index}] Predicted: {prediction}")
+            print(f"    Reference: {reference}")
+
     return metrics
 
 
 def main():
     accelerator = Accelerator()
     args = get_fine_tuning_args()
-    rouge = Rouge()
 
     model_source = args.checkpoint_path if args.checkpoint_path else args.model_name_or_path
     if model_source is None:
@@ -683,7 +687,7 @@ def main():
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        compute_metrics=lambda e: compute_metrics(e, model=model, rouge=rouge),
+        compute_metrics=lambda e: compute_metrics(e, model=model),
     )
 
     trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)
