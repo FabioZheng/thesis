@@ -80,6 +80,37 @@ def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> CosineRetr
     return CosineRetriever(embeddings=embeddings, doc_ids=doc_ids, store=store)
 
 
+def load_answers(path: Optional[str]) -> Dict[str, str]:
+    if not path:
+        return {}
+    if not os.path.exists(path):
+        print(f"Answers file not found at {path}. Proceeding without external answers.")
+        return {}
+
+    with open(path, "r", encoding="utf-8") as handle:
+        raw_answers = json.load(handle)
+
+    answers_map: Dict[str, str] = {}
+    if isinstance(raw_answers, dict):
+        for query_id, answer in raw_answers.items():
+            if answer is None:
+                continue
+            answers_map[str(query_id)] = answer if isinstance(answer, str) else str(answer)
+    elif isinstance(raw_answers, list):
+        for entry in raw_answers:
+            if not isinstance(entry, dict):
+                continue
+            query_id = entry.get("query_id") or entry.get("id")
+            answer = entry.get("answer") or entry.get("text")
+            if query_id is None or answer is None:
+                continue
+            answers_map[str(query_id)] = answer if isinstance(answer, str) else str(answer)
+    else:
+        print("Answers file must be a JSON object or list of objects. Proceeding without external answers.")
+
+    return answers_map
+
+
 def _extract_answer(example: Dict) -> str:
     answers = example.get("answers")
     if isinstance(answers, dict):
@@ -105,17 +136,24 @@ class RAGFineTuneDataset(Dataset):
         query_embedder: TextEmbedder,
         context_store: Dict[str, torch.Tensor],
         top_k: int,
+        answers_map: Optional[Dict[str, str]] = None,
     ) -> None:
         self.context_store = context_store
         self.top_k = top_k
         self.samples: List[Dict[str, object]] = []
+        answers_lookup = answers_map or {}
 
         skipped_due_to_contexts = 0
         for example in tqdm(qa_split, desc="Preparing RAG QA split"):
             question = example.get("question") or example.get("query") or ""
             if not question:
                 continue
-            answer = _extract_answer(example)
+            query_id = example.get("query_id") or example.get("id")
+            answer = ""
+            if query_id is not None:
+                answer = answers_lookup.get(str(query_id), "")
+            if not answer:
+                answer = _extract_answer(example)
             hits = retriever.search(question, query_embedder, k=top_k)
             doc_ids: List[str] = []
             for doc_id, _score, _text in hits:
@@ -351,6 +389,9 @@ def main():
     dataset = datasets.load_dataset(args.dataset_RAG)
 
     context_store = load_context_store(args.rag_contexts_path)
+    answers_map = load_answers(args.rag_answers_path)
+    if accelerator.is_main_process and answers_map:
+        print(f"Loaded {len(answers_map)} external answers for supervision.")
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
     query_embedder = TextEmbedder(
         model_name=args.retriever_model_name,
@@ -365,6 +406,7 @@ def main():
         query_embedder,
         context_store,
         top_k=args.retriever_top_k,
+        answers_map=answers_map,
     )
     eval_dataset = RAGFineTuneDataset(
         dataset["validation"],
@@ -372,6 +414,7 @@ def main():
         query_embedder,
         context_store,
         top_k=args.retriever_top_k,
+        answers_map=answers_map,
     )
 
     del query_embedder
