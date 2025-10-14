@@ -77,7 +77,12 @@ pip3 install -r requirements.txt
 
 # Fine-tuning
 
-Coming soon...
+The fine-tuning entry point is [`fine_tuning.py`](fine_tuning.py). The script loads two kinds of data:
+
+* Question-answer pairs stored under `data/` (or any JSON file you point to with `--rag_queries_path`). The loader accepts either a single mapping of query ids to payloads or nested `{split: {query_id: {...}}}` structures. Each payload must contain a question string, and the answer text can either be embedded alongside the query or provided separately through `--rag_answers_path` (for example `data/answers.json`). The script normalises these JSON files into in-memory train/validation splits, automatically sampling a small validation fold if only a single split is supplied.【F:fine_tuning.py†L55-L233】【F:fine_tuning_parser.py†L33-L45】
+* Pre-computed retrieval artefacts under `data/` (contexts, dense embeddings, and optional document metadata). These files are passed through `--rag_contexts_path`, `--rag_embeddings_path`, and `--rag_docs_path`. They provide the compressed context embeddings that are concatenated with each question during training.【F:fine_tuning.py†L34-L110】【F:fine_tuning_parser.py†L33-L41】
+
+By keeping all training inputs local you can fine-tune entirely offline: the questions/answers in `data/queries.json` (and optionally `data/answers.json`) drive the loss computation, while the retrieval artefacts supply the memory tokens consumed by the RAG trainer.【F:fine_tuning.py†L55-L233】
 ### COCOM 
 To train the `COCOM` model based on `Mistral-7B-Instruct-v0.2 ` with compression rate `128`. We used 8x A100 80GB for pre-training.
 
