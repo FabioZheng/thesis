@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments
 from analyse.retrieval import CosineRetriever, TextEmbedder
-from custom_parser import get_args
+from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
 from metrics import compute_rouge_scores, exact_match_score, f1_score
 from modeling_cocom import COCOM, COCOMConfig
@@ -314,7 +314,7 @@ def compute_metrics(eval_pred, model, rouge):
 
 def main():
     accelerator = Accelerator()
-    args = get_args()
+    args = get_fine_tuning_args()
     rouge = Rouge()
 
     folder_name = f"{Hasher.hash(str(args))}"
