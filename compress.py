@@ -21,7 +21,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", help="Path to MS MARCO dataset file (JSON/JSONL)", default="ms_marco_train.json")
     parser.add_argument(
         "--checkpoint",
+        default=None,
         help="Path to a trained COCOM checkpoint directory for context generation",
+    )
+    parser.add_argument(
+        "--hf_model_name",
+        default=None,
+        help="Hugging Face model id to load instead of a local checkpoint",
     )
     parser.add_argument("--limit", type=int, help="Max number of rows", default=None)
     parser.add_argument("--compression_rate", type=int, help="Fallback rate", default=4)
@@ -193,8 +199,15 @@ def main() -> None:
         )
     )
 
+    if args.checkpoint and args.hf_model_name:
+        raise ValueError("Specify either --checkpoint or --hf_model_name, not both")
+
+    model_source = args.checkpoint or args.hf_model_name
+    if model_source is None:
+        raise ValueError("You must provide either --checkpoint or --hf_model_name")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model_safely(args.checkpoint)
+    model = load_model_safely(model_source)
     model.to(device)
     model.eval()
     print(device)
@@ -216,10 +229,10 @@ def main() -> None:
     contexts = generate_contexts(docs, model, args.compression_rate)
     contexts_path, ctx_mem = save_json(contexts, args.contexts_out, "contexts.json")
     print(
-        "Generated contexts for {count} MS MARCO passages using checkpoint {ckpt} -> {path} "
+        "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
         "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
             count=len(contexts),
-            ckpt=args.checkpoint,
+            model_src=model_source,
             path=contexts_path,
             mem=ctx_mem.get("approx_memory_mb", 0.0),
             pickle=ctx_mem.get("pickle_disk_mb", 0.0),
