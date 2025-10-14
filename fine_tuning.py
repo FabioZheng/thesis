@@ -400,23 +400,52 @@ class RAGDataCollator:
         if any(tensor.size(0) != top_k for tensor in context_embeddings):
             raise ValueError("All samples must have the same number of retrieved contexts.")
 
-        max_mem = max(tensor.size(1) for tensor in context_embeddings)
         hidden = context_embeddings[0].size(2)
+        bos = self.tokenizer.bos_token or ""
+        mem_token_symbol = getattr(self.tokenizer, "mem_token", "") or ""
+
+        trimmed_contexts: List[torch.Tensor] = []
+        mem_per_context: List[int] = []
+        for tensor, question in zip(context_embeddings, questions):
+            sample_max_mem = tensor.size(1)
+            base_prompt = f"{bos}[INST]{question}\n[/INST]\n"
+            base_encoding = self.tokenizer(
+                base_prompt,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                padding=False,
+                truncation=False,
+            )
+            base_ids = base_encoding.get("input_ids", [])
+            if base_ids and isinstance(base_ids[0], list):
+                base_ids = base_ids[0]
+            base_len = len(base_ids)
+            available_mem_tokens = max(0, self.decoder_max_length - base_len)
+            mem_tokens_per_context = min(sample_max_mem, available_mem_tokens // top_k)
+
+            trimmed = tensor[:, :mem_tokens_per_context, :]
+            trimmed_contexts.append(trimmed)
+            mem_per_context.append(mem_tokens_per_context)
+
+        max_effective_mem = max(mem_per_context) if mem_per_context else 0
 
         padded_contexts: List[torch.Tensor] = []
-        for tensor in context_embeddings:
-            if tensor.size(1) < max_mem:
-                pad = torch.zeros((top_k, max_mem - tensor.size(1), hidden), dtype=tensor.dtype)
+        for tensor, effective_mem in zip(trimmed_contexts, mem_per_context):
+            if effective_mem < max_effective_mem:
+                pad = torch.zeros(
+                    (top_k, max_effective_mem - effective_mem, hidden),
+                    dtype=tensor.dtype,
+                    device=tensor.device,
+                )
                 tensor = torch.cat([tensor, pad], dim=1)
             padded_contexts.append(tensor)
         context_batch = torch.stack(padded_contexts, dim=0)
 
-        mem_tokens = self.tokenizer.mem_token * max_mem if max_mem > 0 else ""
-        mem_block = mem_tokens * top_k
-        prompts = [
-            f"{self.tokenizer.bos_token}{mem_block}[INST]{question}\n[/INST]\n"
-            for question in questions
-        ]
+        prompts: List[str] = []
+        for question, mem_count in zip(questions, mem_per_context):
+            mem_tokens = mem_token_symbol * mem_count if mem_count > 0 else ""
+            mem_block = mem_tokens * top_k
+            prompts.append(f"{bos}{mem_block}[INST]{question}\n[/INST]\n")
 
         dec_inputs = self.tokenizer(
             prompts,

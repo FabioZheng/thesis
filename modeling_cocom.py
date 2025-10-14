@@ -6,7 +6,6 @@ from peft import get_peft_model, LoraConfig, TaskType
 import os
 from typing import Dict, Optional
 from metrics import batch_entropy
-import logging
 
 
 def freeze_model(model):
@@ -250,19 +249,33 @@ class COCOM(PreTrainedModel):
     def replace_embeddings(self, compressed_embs, dec_input_ids, indices):
         # Embed the decoder input
         inputs_embeds = self.decoder.get_input_embeddings()(dec_input_ids)
-        num_embs = compressed_embs.size(1)
-        if self.sep:
-            slot_len = num_embs + 1
-        else:
-            slot_len = num_embs
-        # get first mem_token inidices
-        first_mem_token_indices = torch.argmax((dec_input_ids == self.decoder_tokenizer.mem_token_id).int(), dim=1)
+        mem_token_mask = dec_input_ids == self.decoder_tokenizer.mem_token_id
         batch_size = inputs_embeds.size(0)
-        # for each example in batch, replace them with compressed embeddings
+
         for i in range(batch_size):
-            for j in range(indices[i], indices[i + 1]):
-                start_idx = first_mem_token_indices[i].item() + (j - indices[i]) * slot_len
-                inputs_embeds[i, start_idx:start_idx + num_embs, :] = compressed_embs[j]
+            mem_positions = torch.where(mem_token_mask[i])[0]
+            if mem_positions.numel() == 0:
+                continue
+
+            ptr = 0
+            for local_idx, j in enumerate(range(indices[i], indices[i + 1])):
+                current_embs = compressed_embs[j]
+                if current_embs.dtype != inputs_embeds.dtype:
+                    current_embs = current_embs.to(dtype=inputs_embeds.dtype)
+                required = current_embs.size(0)
+                remaining = mem_positions.numel() - ptr
+
+                if remaining <= 0:
+                    break
+
+                use = min(required, remaining)
+                target_positions = mem_positions[ptr:ptr + use]
+                inputs_embeds[i, target_positions, :] = current_embs[:use]
+                ptr += use
+
+                if use < required:
+                    break
+
         return inputs_embeds
 
     def forward(self,
