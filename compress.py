@@ -12,7 +12,7 @@ from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent
 from metrics import batch_entropy
 from utils import pad_tokens_to_rate
-from save_json import load_and_flatten, save_json, save_queries_json
+from save_json import load_and_flatten, save_json, save_queries_json, save_answers_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -283,6 +283,23 @@ def main() -> None:
             mem=queries_mem.get("approx_memory_mb", 0.0),
             pickle=queries_mem.get("pickle_disk_mb", 0.0),
             json=queries_mem.get("json_disk_mb", 0.0),
+        )
+    )
+
+    answers_path, answers_mem = save_answers_json(
+        args.dataset,
+        args.docs_out,
+        "answers.json",
+        query_ids=query_ids or None,
+    )
+    print(
+        "Extracted {count} answers -> {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=answers_mem.get("count", 0),
+            path=answers_path,
+            mem=answers_mem.get("approx_memory_mb", 0.0),
+            pickle=answers_mem.get("pickle_disk_mb", 0.0),
+            json=answers_mem.get("json_disk_mb", 0.0),
         )
     )
 

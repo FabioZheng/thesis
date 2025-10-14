@@ -3,7 +3,8 @@
 
 This module can be executed as a script to download a dataset split and
 materialise it as a JSON document indexed by ``doc_id`` where each entry
-contains a ``query_id`` (if available) and the associated passage text.
+contains a ``query_id`` (if available), the associated passage text, and any
+detected answers.
 """
 
 from __future__ import annotations
@@ -66,10 +67,36 @@ QUERY_TEXT_KEYS: Sequence[str] = (
 )
 
 
+ANSWER_CONTAINER_KEYS: Sequence[str] = (
+    "answers",
+    "answer",
+    "gold_answers",
+    "ground_truth",
+    "ground_truths",
+    "groundtruth",
+    "groundtruths",
+    "label",
+    "labels",
+    "response",
+    "responses",
+    "target",
+    "targets",
+    "completion",
+    "completions",
+    "output",
+    "outputs",
+    "answer_text",
+    "answer_texts",
+)
+
+
 TEXT_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in TEXT_CONTAINER_KEYS)
 NON_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in NON_TEXT_KEYS)
-QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEYS)
+QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEYS)d
 QUERY_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_TEXT_KEYS)
+ANSWER_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in ANSWER_CONTAINER_KEYS)
+
+NO_ANSWER_PLACEHOLDER_NORMALISED: frozenset[str] = frozenset(("no answer present.",))
 
 
 def _find_matching_value(mapping: Mapping[str, Any], ordered_keys: Sequence[str]) -> Any:
@@ -145,6 +172,28 @@ def _flatten_text_container(value: Any) -> list[str]:
     return texts
 
 
+def _normalise_answer(answer: str) -> str:
+    return answer.strip().lower()
+
+
+def _is_placeholder_only_answers(answers: Sequence[str]) -> bool:
+    if not answers:
+        return False
+    normalised = [_normalise_answer(answer) for answer in answers if answer.strip()]
+    if not normalised:
+        return False
+    return all(answer in NO_ANSWER_PLACEHOLDER_NORMALISED for answer in normalised)
+
+
+def _filter_placeholder_answers(answers: Sequence[str]) -> list[str]:
+    filtered: list[str] = []
+    for answer in answers:
+        if _normalise_answer(answer) in NO_ANSWER_PLACEHOLDER_NORMALISED:
+            continue
+        filtered.append(answer)
+    return filtered
+
+
 def _extract_query_id(row: Mapping[str, Any]) -> Union[str, int, float, None]:
     for candidate in QUERY_ID_KEYS_LOWER:
         value = _find_matching_value(row, (candidate,)) if hasattr(row, "items") else None
@@ -170,6 +219,22 @@ def _extract_passage_texts(row: Mapping[str, Any]) -> list[str]:
             unique_texts.append(text)
             seen.add(text)
     return unique_texts
+
+
+def _extract_answer_texts(row: Mapping[str, Any]) -> list[str]:
+    answers: list[str] = []
+    for candidate in ANSWER_CONTAINER_KEYS_LOWER:
+        value = _find_matching_value(row, (candidate,))
+        if value is None:
+            continue
+        answers.extend(_flatten_text_container(value))
+    seen: set[str] = set()
+    unique_answers: list[str] = []
+    for answer in answers:
+        if answer not in seen:
+            unique_answers.append(answer)
+            seen.add(answer)
+    return unique_answers
 
 
 RowIterable = Union[
@@ -221,7 +286,7 @@ def load_and_flatten(
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
     limit: int | None = None,
-) -> Dict[int, Dict[str, Union[str, int, float, None]]]:
+) -> Dict[int, Dict[str, Union[str, int, float, None, list[str]]]]:
     """Load a dataset-like object and flatten it into doc-indexed records.
 
     ``dataset_source`` can be a path to a JSON/JSONL file, a Hugging Face
@@ -232,6 +297,10 @@ def load_and_flatten(
     :func:`datasets.load_dataset`. The optional ``limit`` argument constrains the
     number of rows that will be consumed from ``dataset_source`` before
     flattening passages.
+
+    Each flattened record captures the detected query identifier (if any), the
+    associated passage text, and any answer texts that can be inferred from the
+    original row.
     """
 
     if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
@@ -253,7 +322,7 @@ def load_and_flatten(
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
 
-    docs: Dict[int, Dict[str, Union[str, int, float, None]]] = {}
+    docs: Dict[int, Dict[str, Union[str, int, float, None, list[str]]]] = {}
     doc_id = 0
 
     row_iterable = _iter_rows(dataset_source)
@@ -265,9 +334,19 @@ def load_and_flatten(
         passage_texts = _extract_passage_texts(row)
         if not passage_texts and "text" in row:
             passage_texts = _flatten_text_container(row["text"])
+        answer_texts = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answer_texts):
+            continue
+        answer_texts = _filter_placeholder_answers(answer_texts)
 
         for passage_text in passage_texts:
-            docs[doc_id] = {"query_id": query_id, "text": passage_text}
+            record: Dict[str, Union[str, int, float, None, list[str]]] = {
+                "query_id": query_id,
+                "text": passage_text,
+            }
+            if answer_texts:
+                record["answers"] = answer_texts
+            docs[doc_id] = record
             doc_id += 1
 
     return docs
@@ -315,12 +394,90 @@ def load_queries(
         query_id = _extract_query_id(row)
         if query_id is None:
             continue
+        answers = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answers):
+            continue
         query_text = _extract_query_text(row)
         if not query_text:
             continue
         queries[str(query_id)] = {"text": query_text}
 
     return queries
+
+
+def load_answers(
+    dataset_source: RowIterable,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> Dict[str, list[str]]:
+    """Load a dataset-like object and map each query_id to its answer texts."""
+
+    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
+        dataset_identifier = dataset_source
+        load_kwargs = dict(load_dataset_kwargs or {})
+        if split is not None:
+            load_kwargs.setdefault("split", split)
+        if name is not None:
+            load_kwargs.setdefault("name", name)
+
+        try:
+            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
+        except Exception as error:  # pragma: no cover - network/IO heavy
+            raise ValueError(
+                "Failed to load dataset using datasets.load_dataset; "
+                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
+            ) from error
+
+    answers: Dict[str, list[str]] = {}
+
+    for row in _iter_rows(dataset_source):
+        query_id = _extract_query_id(row)
+        if query_id is None:
+            continue
+        answer_texts = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answer_texts):
+            continue
+        answer_texts = _filter_placeholder_answers(answer_texts)
+        if not answer_texts:
+            continue
+
+        key = str(query_id)
+        existing = answers.setdefault(key, [])
+        for answer in answer_texts:
+            if answer not in existing:
+                existing.append(answer)
+
+    return answers
+
+
+def _filter_payloads_by_query_ids(
+    payloads: Mapping[Any, Any], query_ids: Iterable[Any] | None
+) -> Dict[Any, Any]:
+    if query_ids is None:
+        return dict(payloads)
+
+    allowed_ids = {query_id for query_id in query_ids if query_id is not None}
+    if not allowed_ids:
+        return {}
+
+    allowed_ids_str = {str(query_id) for query_id in allowed_ids}
+
+    def _matches(candidate: Any) -> bool:
+        if candidate in allowed_ids:
+            return True
+        try:
+            candidate_str = str(candidate)
+        except Exception:  # pragma: no cover - defensive
+            return False
+        return candidate_str in allowed_ids_str
+
+    return {
+        query_id: payload
+        for query_id, payload in payloads.items()
+        if _matches(query_id)
+    }
 
 
 def _estimate_memory_usage(obj: Any) -> Dict[str, float]:
@@ -405,31 +562,34 @@ def save_queries_json(
         load_dataset_kwargs=load_dataset_kwargs,
     )
 
-    filtered_queries = queries
-    if query_ids is not None:
-        allowed_ids = {query_id for query_id in query_ids if query_id is not None}
-        if allowed_ids:
-            allowed_ids_str = {str(query_id) for query_id in allowed_ids}
-
-            def _matches(candidate: Any) -> bool:
-                if candidate in allowed_ids:
-                    return True
-                try:
-                    candidate_str = str(candidate)
-                except Exception:  # pragma: no cover - defensive
-                    return False
-                return candidate_str in allowed_ids_str
-
-            filtered_queries = {
-                query_id: payload
-                for query_id, payload in queries.items()
-                if _matches(query_id)
-            }
-        else:
-            filtered_queries = {}
-
+    filtered_queries = _filter_payloads_by_query_ids(queries, query_ids)
     path, mem_stats = save_json(filtered_queries, directory, filename)
     mem_stats["count"] = len(filtered_queries)
+    return path, mem_stats
+
+
+def save_answers_json(
+    dataset_source: RowIterable,
+    directory: str,
+    filename: str = "answers.json",
+    query_ids: Iterable[Any] | None = None,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> Tuple[str, Dict[str, float]]:
+    """Extract answers and persist them as ``{"query_id": [...]}`` JSON."""
+
+    answers = load_answers(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
+
+    filtered_answers = _filter_payloads_by_query_ids(answers, query_ids)
+    path, mem_stats = save_json(filtered_answers, directory, filename)
+    mem_stats["count"] = len(filtered_answers)
     return path, mem_stats
 
 
@@ -474,7 +634,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Save a Hugging Face dataset split as a JSON mapping of doc_id to "
-            "{query_id, text}."
+            "{query_id, text, answers}."
         )
     )
     parser.add_argument(
