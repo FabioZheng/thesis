@@ -4,6 +4,7 @@ import torch
 import math
 from peft import get_peft_model, LoraConfig, TaskType
 import os
+from typing import Dict, Optional
 from metrics import batch_entropy
 import logging
 
@@ -303,6 +304,34 @@ class COCOM(PreTrainedModel):
         avg_loss = total_loss / len(all_compressed_embs)
 
         return {"loss": avg_loss, "logits": all_logits}  # Returns average loss and list of logits
+
+    def forward_with_context_embeddings(
+        self,
+        context_embeddings: torch.Tensor,
+        dec_input_ids: torch.LongTensor,
+        dec_attention_mask: torch.LongTensor,
+        labels: Optional[torch.LongTensor] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if context_embeddings.dim() == 3:
+            context_embeddings = context_embeddings.unsqueeze(0)
+        if context_embeddings.dim() != 4:
+            raise ValueError("context_embeddings must have shape (batch, top_k, mem, hidden)")
+
+        batch_size, top_k, mem_tokens, hidden = context_embeddings.size()
+        flattened = context_embeddings.reshape(batch_size * top_k, mem_tokens, hidden)
+        self.generation_top_k = top_k
+
+        indices = range(0, flattened.size(0) + 1, top_k)
+        compressed_embs = flattened.to(dec_input_ids.device)
+        inputs_embeds = self.replace_embeddings(compressed_embs, dec_input_ids, indices)
+
+        decoder_outputs = self.decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=dec_attention_mask,
+            labels=labels,
+        )
+
+        return {"loss": decoder_outputs.loss, "logits": [decoder_outputs.logits]}
 
     def generate(self, model_input, max_new_tokens=128):
         device = self.decoder.device

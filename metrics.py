@@ -1,12 +1,13 @@
-import numpy as np 
-
-import regex 
-import string
+import numpy as np
+from collections import Counter
 from typing import List
-from rouge import Rouge
+
 import evaluate
 import math
-from collections import Counter
+import numpy as np
+import regex
+import string
+from rouge import Rouge
 
 
 def normalize(s: str) -> str:
@@ -32,7 +33,38 @@ def em_single(prediction, ground_truth):
 
 
 def exact_match_score(predictions, references):
-    return np.mean([em_single(prediction, ground_truth) for ground_truth, prediction in zip(references, predictions)])
+    return np.mean([
+        em_single(prediction, ground_truth)
+        for ground_truth, prediction in zip(references, predictions)
+    ])
+
+
+def f1_single(prediction: str, ground_truth: str) -> float:
+    prediction_tokens = normalize(prediction).split()
+    ground_truth_tokens = normalize(ground_truth).split()
+
+    if not prediction_tokens and not ground_truth_tokens:
+        return 1.0
+    if not prediction_tokens or not ground_truth_tokens:
+        return 0.0
+
+    common = Counter(prediction_tokens) & Counter(ground_truth_tokens)
+    num_same = sum(common.values())
+    if num_same == 0:
+        return 0.0
+
+    precision = num_same / len(prediction_tokens)
+    recall = num_same / len(ground_truth_tokens)
+    if precision + recall == 0:
+        return 0.0
+    return 2 * precision * recall / (precision + recall)
+
+
+def f1_score(predictions: List[str], references: List[str]) -> float:
+    return np.mean([
+        f1_single(prediction, ground_truth)
+        for prediction, ground_truth in zip(predictions, references)
+    ])
 
 
 def rouge_wrapper(rouge, prediction, ground_truth):
@@ -82,6 +114,5 @@ def batch_entropy(input_ids, attention_mask) -> List[float]:
         ent = -sum(p * math.log(p, 2) for p in probs)
         entropies.append(ent)
     return entropies
-
 
 
