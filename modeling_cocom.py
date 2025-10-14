@@ -216,7 +216,20 @@ class COCOM(PreTrainedModel):
             if self.bandit_agent is not None:
                 entropies = batch_entropy(enc_input_ids, enc_attention_mask)
                 avg_entropy = sum(entropies) / len(entropies)
-                rate = self.bandit_agent.select_rate(avg_entropy)
+                if getattr(self.bandit_agent, "use_length_feature", False):
+                    lengths = (
+                        enc_attention_mask.sum(dim=1).detach().cpu().tolist()
+                        if enc_attention_mask is not None
+                        else []
+                    )
+                    avg_length = (
+                        sum(float(l) for l in lengths) / len(lengths)
+                        if lengths
+                        else 0.0
+                    )
+                else:
+                    avg_length = None
+                rate = self.bandit_agent.select_rate(avg_entropy, avg_length)
                 self.current_rate = rate
             else:
                 rate = self.current_rate

@@ -1,23 +1,34 @@
 import math
 from collections import Counter
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 import numpy as np
 import torch
 
 class CompressionBanditAgent:
     """Simple contextual multi-armed bandit using linear UCB."""
 
-    def __init__(self, rates: Iterable[int], alpha: float = 1.0):
+    def __init__(
+        self,
+        rates: Iterable[int],
+        alpha: float = 1.0,
+        use_length_feature: bool = False,
+    ):
         self.rates = list(rates)
         self.alpha = alpha
-        self.A = {r: np.identity(1) for r in self.rates}
-        self.b = {r: np.zeros((1, 1)) for r in self.rates}
+        self.use_length_feature = use_length_feature
+        self._feature_dim = 2 if self.use_length_feature else 1
+        self.A = {r: np.identity(self._feature_dim) for r in self.rates}
+        self.b = {r: np.zeros((self._feature_dim, 1)) for r in self.rates}
 
-    def _feat(self, entropy: float) -> np.ndarray:
+    def _feat(self, entropy: float, length: Optional[float] = None) -> np.ndarray:
+        if self.use_length_feature:
+            if length is None:
+                raise ValueError("Length feature is enabled but no length was provided.")
+            return np.array([[entropy], [length]], dtype=float)
         return np.array([[entropy]], dtype=float)
 
-    def select_rate(self, entropy: float) -> int:
-        x = self._feat(entropy)
+    def select_rate(self, entropy: float, length: Optional[float] = None) -> int:
+        x = self._feat(entropy, length)
         scores = {}
         for r in self.rates:
             A_inv = np.linalg.inv(self.A[r])
@@ -26,8 +37,14 @@ class CompressionBanditAgent:
             scores[r] = p
         return max(self.rates, key=lambda r: scores[r])
 
-    def update(self, entropy: float, rate: int, reward: float) -> None:
-        x = self._feat(entropy)
+    def update(
+        self,
+        entropy: float,
+        rate: int,
+        reward: float,
+        length: Optional[float] = None,
+    ) -> None:
+        x = self._feat(entropy, length)
         self.A[rate] += x @ x.T
         self.b[rate] += reward * x
 
