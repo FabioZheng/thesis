@@ -1,9 +1,10 @@
 import argparse
 import os
 import pickle
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import numpy as np
 
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
@@ -21,7 +22,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", help="Path to MS MARCO dataset file (JSON/JSONL)", default="ms_marco_train.json")
     parser.add_argument(
         "--checkpoint",
+        default=None,
         help="Path to a trained COCOM checkpoint directory for context generation",
+    )
+    parser.add_argument(
+        "--hf_model_name",
+        default=None,
+        help="Hugging Face model id to load instead of a local checkpoint",
     )
     parser.add_argument("--limit", type=int, help="Max number of rows", default=None)
     parser.add_argument("--compression_rate", type=int, help="Fallback rate", default=4)
@@ -156,7 +163,7 @@ def generate_embeddings(
     batch_size: int,
     device: Optional[str],
     normalize: bool,
-) -> Dict[int, Dict[str, Any]]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     embedder = TextEmbedder(
         model_name=model_name,
         batch_size=batch_size,
@@ -166,15 +173,40 @@ def generate_embeddings(
 
     doc_ids: List[int] = sorted(docs.keys())
     texts: List[str] = [docs[doc_id]["text"] for doc_id in doc_ids]
+    query_ids: List[Any] = [docs[doc_id]["query_id"] for doc_id in doc_ids]
+
     embeddings_array = embedder.encode(texts)
 
-    embeddings: Dict[int, Dict[str, Any]] = {}
-    for idx, doc_id in enumerate(doc_ids):
-        embeddings[doc_id] = {
-            "query_id": docs[doc_id]["query_id"],
-            "embedding": embeddings_array[idx].tolist(),
-        }
-    return embeddings
+    return (
+        np.asarray(doc_ids, dtype=np.int64),
+        np.asarray([str(qid) for qid in query_ids], dtype=np.str_),
+        np.asarray(embeddings_array, dtype=np.float32),
+    )
+
+
+def save_embeddings_npz(
+    doc_ids: np.ndarray,
+    query_ids: np.ndarray,
+    embeddings: np.ndarray,
+    output_dir: str,
+    filename: str = "embeddings.npz",
+) -> Tuple[str, Dict[str, Any]]:
+    """Persist embeddings alongside their document and query identifiers."""
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    np.savez_compressed(
+        output_path,
+        doc_ids=doc_ids,
+        query_ids=query_ids,
+        embeddings=embeddings,
+    )
+
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    memory_stats: Dict[str, Any] = {
+        "embeddings_shape": tuple(int(dim) for dim in embeddings.shape),
+        "approx_disk_mb": file_size_mb,
+    }
+    return output_path, memory_stats
 
 
 def main() -> None:
@@ -193,8 +225,15 @@ def main() -> None:
         )
     )
 
+    if args.checkpoint and args.hf_model_name:
+        raise ValueError("Specify either --checkpoint or --hf_model_name, not both")
+
+    model_source = args.checkpoint or args.hf_model_name
+    if model_source is None:
+        raise ValueError("You must provide either --checkpoint or --hf_model_name")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = load_model_safely(args.checkpoint)
+    model = load_model_safely(model_source)
     model.to(device)
     model.eval()
     print(device)
@@ -216,10 +255,10 @@ def main() -> None:
     contexts = generate_contexts(docs, model, args.compression_rate)
     contexts_path, ctx_mem = save_json(contexts, args.contexts_out, "contexts.json")
     print(
-        "Generated contexts for {count} MS MARCO passages using checkpoint {ckpt} -> {path} "
+        "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
         "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
             count=len(contexts),
-            ckpt=args.checkpoint,
+            model_src=model_source,
             path=contexts_path,
             mem=ctx_mem.get("approx_memory_mb", 0.0),
             pickle=ctx_mem.get("pickle_disk_mb", 0.0),
@@ -227,22 +266,26 @@ def main() -> None:
         )
     )
 
-    embeddings = generate_embeddings(
+    doc_ids, query_ids, embeddings = generate_embeddings(
         docs,
         args.embedder_model,
         args.embedder_batch_size,
         args.embedder_device,
         not args.no_embedder_normalize,
     )
-    emb_path, emb_mem = save_json(embeddings, args.embeddings_out, "embeddings.json")
+    emb_path, emb_mem = save_embeddings_npz(
+        doc_ids,
+        query_ids,
+        embeddings,
+        args.embeddings_out,
+    )
     print(
         "Generated embeddings for {count} MS MARCO passages -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=len(embeddings),
+        "(shape: {shape}, approx disk: {disk:.2f} MB)".format(
+            count=len(doc_ids),
             path=emb_path,
-            mem=emb_mem.get("approx_memory_mb", 0.0),
-            pickle=emb_mem.get("pickle_disk_mb", 0.0),
-            json=emb_mem.get("json_disk_mb", 0.0),
+            shape=emb_mem.get("embeddings_shape"),
+            disk=emb_mem.get("approx_disk_mb", 0.0),
         )
     )
 
