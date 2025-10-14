@@ -62,7 +62,12 @@ def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
 
     agent_rates = agent_data.get("rates", rates)
     agent_alpha = agent_data.get("alpha", 1.0)
-    agent = CompressionBanditAgent(agent_rates, alpha=agent_alpha)
+    agent_use_length = agent_data.get("use_length_feature", False)
+    agent = CompressionBanditAgent(
+        agent_rates,
+        alpha=agent_alpha,
+        use_length_feature=agent_use_length,
+    )
 
     # Restore learned parameters if available
     if "A" in agent_data:
@@ -100,10 +105,13 @@ def generate_contexts(
         )
         selected_rate = fallback_rate
         entropy: Optional[float] = None
+        length: Optional[float] = None
         if agent is not None:
             entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
+            if agent.use_length_feature:
+                length = float(tokens["attention_mask"].sum().item())
             try:
-                selected_rate = agent.select_rate(float(entropy))
+                selected_rate = agent.select_rate(float(entropy), length)
             except Exception:
                 selected_rate = fallback_rate
 
@@ -130,9 +138,14 @@ def generate_contexts(
         }
         if entropy is not None:
             contexts[doc_id]["entropy"] = entropy
+        if length is not None:
+            contexts[doc_id]["length"] = length
 
         # Update progress description
-        pbar.set_postfix({"rate": selected_rate, "entropy": entropy})
+        postfix = {"rate": selected_rate, "entropy": entropy}
+        if length is not None:
+            postfix["length"] = length
+        pbar.set_postfix(postfix)
 
     return contexts
 

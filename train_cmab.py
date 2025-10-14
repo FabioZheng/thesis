@@ -99,6 +99,11 @@ def get_args():
     parser.add_argument("--bertscore_rescale", action="store_true", help="Rescale BERTScore with baseline")
     parser.add_argument("--display_every", type=int, default=100, help="Frequency (in examples) to display reconstruction samples")
     parser.add_argument("--save_every", type=int, default=0, help="Save the bandit agent every N examples (0 disables periodic saves)")
+    parser.add_argument(
+        "--use_length_feature",
+        action="store_true",
+        help="Augment the bandit's context with document length in addition to entropy",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +214,7 @@ def save_agent_state(agent, output_dir, args, model_source, step, note="periodic
         "b": agent.b,
         "rates": agent.rates,
         "alpha": agent.alpha,
+        "use_length_feature": agent.use_length_feature,
         "training_info": {
             "num_examples": args.num_examples,
             "doc_max_length": args.doc_max_length,
@@ -252,7 +258,11 @@ def main():
     print(f"Model compression rates: {model.compr_rates}")
 
     # Initialize bandit agent
-    agent = CompressionBanditAgent(model.compr_rates, alpha=args.alpha)
+    agent = CompressionBanditAgent(
+        model.compr_rates,
+        alpha=args.alpha,
+        use_length_feature=args.use_length_feature,
+    )
     model.set_bandit_agent(agent)
 
     # Load and prepare dataset
@@ -320,6 +330,10 @@ def main():
         texts = batch.pop("text")
         # Compute contexts (entropy) on CPU tensors expected by batch_entropy
         entropies = batch_entropy(batch["enc_input_ids"], batch["enc_attention_mask"])
+        if args.use_length_feature:
+            lengths = batch["enc_attention_mask"].sum(dim=1).tolist()
+        else:
+            lengths = [None] * len(entropies)
 
         ent_arr = np.asarray(entropies, dtype=float)
         ent_min = float(ent_arr.min()) if ent_arr.size else float('nan')
@@ -336,9 +350,10 @@ def main():
 
         # Process each example independently: select → play → update
         for i in range(B):
-            x = float(entropies[i])  # context feature (entropy); if you use d>1 features, pass a vector
+            entropy = float(entropies[i])
+            length = float(lengths[i]) if lengths[i] is not None else None
             # UCB arm selection (uses A_a, b_a, alpha inside the agent)
-            chosen_rate = agent.select_rate(x)
+            chosen_rate = agent.select_rate(entropy, length)
 
             # Build a single-example sub-batch
             ex = {
@@ -365,7 +380,7 @@ def main():
             r = args.r_alpha * bertscore_f1 + args.r_beta * rouge_l - args.r_gamma * compression_penalty
 
             # Online update ONLY the chosen arm with (x, r)
-            agent.update(x, chosen_rate, r)
+            agent.update(entropy, chosen_rate, r, length)
 
             # Accounting
             rate_reward_sum[chosen_rate] += r
