@@ -96,6 +96,8 @@ QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEY
 QUERY_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_TEXT_KEYS)
 ANSWER_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in ANSWER_CONTAINER_KEYS)
 
+NO_ANSWER_PLACEHOLDER_NORMALISED: frozenset[str] = frozenset(("no answer present.",))
+
 
 def _find_matching_value(mapping: Mapping[str, Any], ordered_keys: Sequence[str]) -> Any:
     for candidate in ordered_keys:
@@ -168,6 +170,28 @@ def _flatten_text_container(value: Any) -> list[str]:
     if string_value:
         texts.append(string_value)
     return texts
+
+
+def _normalise_answer(answer: str) -> str:
+    return answer.strip().lower()
+
+
+def _is_placeholder_only_answers(answers: Sequence[str]) -> bool:
+    if not answers:
+        return False
+    normalised = [_normalise_answer(answer) for answer in answers if answer.strip()]
+    if not normalised:
+        return False
+    return all(answer in NO_ANSWER_PLACEHOLDER_NORMALISED for answer in normalised)
+
+
+def _filter_placeholder_answers(answers: Sequence[str]) -> list[str]:
+    filtered: list[str] = []
+    for answer in answers:
+        if _normalise_answer(answer) in NO_ANSWER_PLACEHOLDER_NORMALISED:
+            continue
+        filtered.append(answer)
+    return filtered
 
 
 def _extract_query_id(row: Mapping[str, Any]) -> Union[str, int, float, None]:
@@ -311,6 +335,9 @@ def load_and_flatten(
         if not passage_texts and "text" in row:
             passage_texts = _flatten_text_container(row["text"])
         answer_texts = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answer_texts):
+            continue
+        answer_texts = _filter_placeholder_answers(answer_texts)
 
         for passage_text in passage_texts:
             record: Dict[str, Union[str, int, float, None, list[str]]] = {
@@ -367,6 +394,9 @@ def load_queries(
         query_id = _extract_query_id(row)
         if query_id is None:
             continue
+        answers = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answers):
+            continue
         query_text = _extract_query_text(row)
         if not query_text:
             continue
@@ -407,6 +437,9 @@ def load_answers(
         if query_id is None:
             continue
         answer_texts = _extract_answer_texts(row)
+        if _is_placeholder_only_answers(answer_texts):
+            continue
+        answer_texts = _filter_placeholder_answers(answer_texts)
         if not answer_texts:
             continue
 
