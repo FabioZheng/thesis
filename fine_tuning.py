@@ -4,9 +4,8 @@ import os
 import random
 import shutil
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
-import datasets
 import numpy as np
 import torch
 from accelerate import Accelerator
@@ -80,6 +79,40 @@ def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> CosineRetr
     return CosineRetriever(embeddings=embeddings, doc_ids=doc_ids, store=store)
 
 
+def _flatten_answer_texts(payload: object) -> List[str]:
+    if payload is None:
+        return []
+    if isinstance(payload, str):
+        text = payload.strip()
+        return [text] if text else []
+    if isinstance(payload, (list, tuple, set)):
+        texts: List[str] = []
+        for item in payload:
+            texts.extend(_flatten_answer_texts(item))
+        return texts
+    if isinstance(payload, dict):
+        for key in ("text", "answers", "answer", "labels"):
+            if key in payload:
+                texts = _flatten_answer_texts(payload[key])
+                if texts:
+                    return texts
+        texts: List[str] = []
+        for value in payload.values():
+            texts.extend(_flatten_answer_texts(value))
+        return texts
+    return []
+
+
+def _normalise_answers_payload(payload: object) -> Optional[Dict[str, List[str]]]:
+    texts: List[str] = []
+    for answer in _flatten_answer_texts(payload):
+        if answer and answer not in texts:
+            texts.append(answer)
+    if not texts:
+        return None
+    return {"text": texts}
+
+
 def _extract_answer(example: Dict) -> str:
     answers = example.get("answers")
     if isinstance(answers, dict):
@@ -97,10 +130,181 @@ def _extract_answer(example: Dict) -> str:
     return example.get("answer", "") or ""
 
 
+def _extract_question_text(payload: object) -> str:
+    if isinstance(payload, str):
+        return payload
+    if isinstance(payload, dict):
+        for key in ("question", "query", "text", "prompt"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value
+        for value in payload.values():
+            if isinstance(value, str) and value.strip():
+                return value
+    return ""
+
+
+def _coerce_query_mapping(data: object) -> Dict[str, object]:
+    mapping: Dict[str, object] = {}
+    if isinstance(data, dict):
+        for key, value in data.items():
+            mapping[_to_str_doc_id(key)] = value
+    elif isinstance(data, list):
+        for index, value in enumerate(data):
+            query_id: Optional[object] = None
+            if isinstance(value, dict):
+                query_id = (
+                    value.get("query_id")
+                    or value.get("id")
+                    or value.get("qid")
+                    or value.get("question_id")
+                )
+            mapping[_to_str_doc_id(query_id if query_id is not None else index)] = value
+    return mapping
+
+
+def _coerce_queries_by_split(queries_payload: object) -> Dict[str, Dict[str, object]]:
+    if isinstance(queries_payload, dict):
+        lower_keys = {str(key).lower() for key in queries_payload.keys()}
+        if any(key in {"train", "validation", "val", "dev", "test"} for key in lower_keys):
+            splits: Dict[str, Dict[str, object]] = {}
+            for split_name, value in queries_payload.items():
+                splits[str(split_name).lower()] = _coerce_query_mapping(value)
+            return splits
+        return {"train": _coerce_query_mapping(queries_payload)}
+    if isinstance(queries_payload, list):
+        return {"train": _coerce_query_mapping(queries_payload)}
+    raise ValueError("Unsupported queries JSON structure. Expected dict or list.")
+
+
+def _coerce_answers_lookup(answers_payload: object) -> Dict[str, object]:
+    if answers_payload is None:
+        return {}
+    lookup: Dict[str, object] = {}
+    if isinstance(answers_payload, dict):
+        for key, value in answers_payload.items():
+            lookup[_to_str_doc_id(key)] = value
+    elif isinstance(answers_payload, list):
+        for entry in answers_payload:
+            if isinstance(entry, dict):
+                query_id = (
+                    entry.get("query_id")
+                    or entry.get("id")
+                    or entry.get("qid")
+                    or entry.get("question_id")
+                )
+                if query_id is None:
+                    continue
+                lookup[_to_str_doc_id(query_id)] = entry
+    return lookup
+
+
+def _lookup_answer_payload(answers_lookup: Dict[str, object], query_id: str) -> Optional[object]:
+    if query_id in answers_lookup:
+        return answers_lookup[query_id]
+    try:
+        numeric_key = str(int(float(query_id)))
+    except Exception:
+        numeric_key = None
+    if numeric_key and numeric_key in answers_lookup:
+        return answers_lookup[numeric_key]
+    return None
+
+
+def _build_split_examples(
+    queries: Dict[str, object],
+    answers_lookup: Dict[str, object],
+) -> List[Dict[str, object]]:
+    examples: List[Dict[str, object]] = []
+    for query_id, payload in queries.items():
+        question = _extract_question_text(payload)
+        if not question:
+            continue
+
+        answer_payload: Optional[object] = None
+        if isinstance(payload, dict):
+            for key in ("answers", "answer"):
+                if key in payload:
+                    answer_payload = payload[key]
+                    break
+        if answer_payload is None:
+            answer_payload = _lookup_answer_payload(answers_lookup, query_id)
+
+        answers_dict = _normalise_answers_payload(answer_payload)
+        if answers_dict is None:
+            continue
+
+        examples.append({"question": question, "answers": answers_dict})
+    return examples
+
+
+def load_local_qa_splits(
+    queries_path: str,
+    answers_path: Optional[str],
+) -> Tuple[List[Dict[str, object]], List[Dict[str, object]]]:
+    if not os.path.exists(queries_path):
+        raise FileNotFoundError(f"Queries JSON not found at {queries_path}.")
+
+    with open(queries_path, "r", encoding="utf-8") as handle:
+        queries_payload = json.load(handle)
+
+    answers_payload: Optional[object] = None
+    if answers_path and os.path.exists(answers_path):
+        with open(answers_path, "r", encoding="utf-8") as handle:
+            answers_payload = json.load(handle)
+
+    queries_by_split = _coerce_queries_by_split(queries_payload)
+    answers_lookup = _coerce_answers_lookup(answers_payload)
+
+    split_examples: Dict[str, List[Dict[str, object]]] = {}
+    for split_name, split_queries in queries_by_split.items():
+        split_examples[split_name] = _build_split_examples(split_queries, answers_lookup)
+
+    if not split_examples:
+        raise ValueError("No queries with answers found in the provided JSON files.")
+
+    train_candidates = [
+        key for key in ("train", "training") if key in split_examples and split_examples[key]
+    ]
+    if train_candidates:
+        train_examples = split_examples.pop(train_candidates[0])
+    else:
+        first_key = next(iter(split_examples))
+        train_examples = split_examples.pop(first_key)
+
+    eval_candidates = [
+        key
+        for key in ("validation", "val", "dev", "test")
+        if key in split_examples and split_examples[key]
+    ]
+
+    if eval_candidates:
+        eval_examples = split_examples.pop(eval_candidates[0])
+    else:
+        if len(train_examples) < 2:
+            eval_examples = list(train_examples)
+        else:
+            eval_count = max(1, int(round(len(train_examples) * 0.1)))
+            eval_indices = set(random.sample(range(len(train_examples)), eval_count))
+            eval_examples = [
+                example for idx, example in enumerate(train_examples) if idx in eval_indices
+            ]
+            train_examples = [
+                example for idx, example in enumerate(train_examples) if idx not in eval_indices
+            ]
+
+    if not train_examples:
+        raise ValueError("No training queries available after processing local JSON files.")
+    if not eval_examples:
+        raise ValueError("No evaluation queries available after processing local JSON files.")
+
+    return train_examples, eval_examples
+
+
 class RAGFineTuneDataset(Dataset):
     def __init__(
         self,
-        qa_split: datasets.arrow_dataset.Dataset,
+        qa_split: Iterable[Dict],
         retriever: CosineRetriever,
         query_embedder: TextEmbedder,
         context_store: Dict[str, torch.Tensor],
@@ -159,17 +363,16 @@ class RAGFineTuneDataset(Dataset):
         if not context_tensors:
             raise ValueError("Missing context tensors for retrieved document ids.")
 
+
         max_mem = max(tensor.size(0) for tensor in context_tensors)
         hidden = context_tensors[0].size(1)
-        padded_contexts: List[torch.Tensor] = []
+        padded_contexts = []
         for tensor in context_tensors:
-            if tensor.size(1) != hidden:
-                raise ValueError("Inconsistent hidden size across context tensors.")
             if tensor.size(0) < max_mem:
                 pad = torch.zeros((max_mem - tensor.size(0), hidden), dtype=tensor.dtype)
                 tensor = torch.cat([tensor, pad], dim=0)
             padded_contexts.append(tensor)
-        stacked = torch.stack(padded_contexts, dim=0)  # (top_k, mem, hidden)
+        stacked = torch.stack(padded_contexts, dim=0)
 
         return {
             "question": question,
@@ -272,7 +475,7 @@ class FineTuningTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         context_embeddings = inputs.get("context_embeddings")
         if context_embeddings is not None:
-            outputs = model.forward_with_context_embeddings(
+            outputs = model.module.forward_with_context_embeddings(
                 context_embeddings=context_embeddings,
                 dec_input_ids=inputs["dec_input_ids"],
                 dec_attention_mask=inputs["dec_attention_mask"],
@@ -348,8 +551,6 @@ def main():
         )
         wandb.init(project="COCOM QA Finetune", name=run_name)
 
-    dataset = datasets.load_dataset(args.dataset_RAG)
-
     context_store = load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
     query_embedder = TextEmbedder(
@@ -359,15 +560,20 @@ def main():
         normalize=True,
     )
 
+    train_examples, eval_examples = load_local_qa_splits(
+        queries_path=args.rag_queries_path,
+        answers_path=args.rag_answers_path,
+    )
+
     train_dataset = RAGFineTuneDataset(
-        dataset["train"],
+        train_examples,
         retriever,
         query_embedder,
         context_store,
         top_k=args.retriever_top_k,
     )
     eval_dataset = RAGFineTuneDataset(
-        dataset["validation"],
+        eval_examples,
         retriever,
         query_embedder,
         context_store,
@@ -408,6 +614,8 @@ def main():
         max_grad_norm=1.0,
         remove_unused_columns=False,
     )
+
+    accelerator = Accelerator()
 
     world_size = max(accelerator.num_processes, 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation

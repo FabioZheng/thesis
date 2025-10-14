@@ -39,11 +39,16 @@ def get_fine_tuning_args():
         default=None,
         help="Optional override for the compression projection layout when not using the pretrained value.",
     )
-    parser.add_argument("--dataset_RAG", type=str, default="ms_marco")
     parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.pt")
     parser.add_argument("--rag_embeddings_path", type=str, default="data/embeddings/embeddings.npz")
     parser.add_argument("--rag_docs_path", type=str, default="data/docs.json")
     parser.add_argument("--rag_queries_path", type=str, default="data/queries.json")
+    parser.add_argument(
+        "--rag_answers_path",
+        type=str,
+        default="data/answers.json",
+        help="Optional path to a JSON file containing answers for each query id.",
+    )
     parser.add_argument(
         "--retriever_model_name",
         type=str,
