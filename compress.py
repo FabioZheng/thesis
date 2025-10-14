@@ -12,7 +12,7 @@ from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent
 from metrics import batch_entropy
 from utils import pad_tokens_to_rate
-from save_json import load_and_flatten, save_json
+from save_json import load_and_flatten, save_json, save_queries_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -138,9 +138,10 @@ def generate_contexts(
                 attention_mask=tokens["attention_mask"],
                 rate=selected_rate,
             )
+        context_tensor = emb.detach().cpu()
         contexts[doc_id] = {
             "query_id": item["query_id"],
-            "context": emb.cpu().tolist(),
+            "context": context_tensor,
             "compression_rate": selected_rate,
         }
         if entropy is not None:
@@ -155,6 +156,44 @@ def generate_contexts(
         pbar.set_postfix(postfix)
 
     return contexts
+
+
+def _estimate_context_memory_mb(contexts: Dict[int, Dict[str, Any]]) -> float:
+    total_bytes = 0
+    for item in contexts.values():
+        context = item.get("context")
+        if isinstance(context, torch.Tensor):
+            total_bytes += context.element_size() * context.nelement()
+        elif context is not None:
+            tensor = torch.as_tensor(context)
+            total_bytes += tensor.element_size() * tensor.nelement()
+    return total_bytes / (1024 * 1024)
+
+
+def save_contexts(
+    contexts: Dict[int, Dict[str, Any]], directory: str, filename: str = "contexts.pt"
+) -> Tuple[str, Dict[str, Any]]:
+    os.makedirs(directory, exist_ok=True)
+    path = os.path.join(directory, filename)
+
+    serialisable_contexts: Dict[int, Dict[str, Any]] = {}
+    for doc_id, payload in contexts.items():
+        context = payload.get("context")
+        if context is None:
+            raise ValueError(f"Missing context tensor for document id {doc_id}")
+        tensor_context = context.cpu() if isinstance(context, torch.Tensor) else torch.as_tensor(context)
+        serialisable_contexts[doc_id] = {
+            **payload,
+            "context": tensor_context,
+        }
+
+    torch.save(serialisable_contexts, path)
+
+    memory_stats: Dict[str, Any] = {
+        "approx_memory_mb": _estimate_context_memory_mb(serialisable_contexts),
+        "pt_disk_mb": os.path.getsize(path) / (1024 * 1024),
+    }
+    return path, memory_stats
 
 
 def generate_embeddings(
@@ -225,6 +264,28 @@ def main() -> None:
         )
     )
 
+    query_ids = {
+        payload["query_id"]
+        for payload in docs.values()
+        if payload.get("query_id") is not None
+    }
+    queries_path, queries_mem = save_queries_json(
+        args.dataset,
+        args.docs_out,
+        "queries.json",
+        query_ids=query_ids or None,
+    )
+    print(
+        "Extracted {count} queries -> {path} "
+        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=queries_mem.get("count", 0),
+            path=queries_path,
+            mem=queries_mem.get("approx_memory_mb", 0.0),
+            pickle=queries_mem.get("pickle_disk_mb", 0.0),
+            json=queries_mem.get("json_disk_mb", 0.0),
+        )
+    )
+
     if args.checkpoint and args.hf_model_name:
         raise ValueError("Specify either --checkpoint or --hf_model_name, not both")
 
@@ -253,16 +314,15 @@ def main() -> None:
         print("No bandit agent provided; defaulting to fallback compression rate")
 
     contexts = generate_contexts(docs, model, args.compression_rate)
-    contexts_path, ctx_mem = save_json(contexts, args.contexts_out, "contexts.json")
+    contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.pt")
     print(
         "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+        "(approx memory: {mem:.2f} MB, disk: {disk:.2f} MB)".format(
             count=len(contexts),
             model_src=model_source,
             path=contexts_path,
             mem=ctx_mem.get("approx_memory_mb", 0.0),
-            pickle=ctx_mem.get("pickle_disk_mb", 0.0),
-            json=ctx_mem.get("json_disk_mb", 0.0),
+            disk=ctx_mem.get("pt_disk_mb", 0.0),
         )
     )
 

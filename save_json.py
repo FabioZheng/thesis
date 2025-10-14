@@ -390,12 +390,13 @@ def save_queries_json(
     dataset_source: RowIterable,
     directory: str,
     filename: str = "queries.json",
+    query_ids: Iterable[Any] | None = None,
     *,
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
 ) -> Tuple[str, Dict[str, float]]:
-    """Extract queries and persist them as ``{query_id: {"text": ...}}`` JSON."""
+    """Extract queries and persist them as ``{"query_id": {"text": ...}}`` JSON."""
 
     queries = load_queries(
         dataset_source,
@@ -403,7 +404,33 @@ def save_queries_json(
         name=name,
         load_dataset_kwargs=load_dataset_kwargs,
     )
-    return save_json(queries, directory, filename)
+
+    filtered_queries = queries
+    if query_ids is not None:
+        allowed_ids = {query_id for query_id in query_ids if query_id is not None}
+        if allowed_ids:
+            allowed_ids_str = {str(query_id) for query_id in allowed_ids}
+
+            def _matches(candidate: Any) -> bool:
+                if candidate in allowed_ids:
+                    return True
+                try:
+                    candidate_str = str(candidate)
+                except Exception:  # pragma: no cover - defensive
+                    return False
+                return candidate_str in allowed_ids_str
+
+            filtered_queries = {
+                query_id: payload
+                for query_id, payload in queries.items()
+                if _matches(query_id)
+            }
+        else:
+            filtered_queries = {}
+
+    path, mem_stats = save_json(filtered_queries, directory, filename)
+    mem_stats["count"] = len(filtered_queries)
+    return path, mem_stats
 
 
 def trim_json_file(
