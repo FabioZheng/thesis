@@ -317,13 +317,35 @@ def main():
     args = get_fine_tuning_args()
     rouge = Rouge()
 
+    model_source = args.checkpoint_path if args.checkpoint_path else args.model_name_or_path
+    if model_source is None:
+        raise ValueError("Either --model_name_or_path or --checkpoint_path must be provided.")
+
+    cfg = COCOMConfig.from_pretrained(model_source)
+    lora = args.lora.lower() == "true"
+
+    if args.compression_rates is not None:
+        cfg.compr_rates = list(args.compression_rates)
+    compression_rates = list(cfg.compr_rates) if cfg.compr_rates is not None else []
+
+    if args.compression_linear_type is not None:
+        cfg.compr_linear_type = args.compression_linear_type
+
+    cfg.generation_top_k = args.retriever_top_k
+    cfg.lora = lora
+
+    compressor_model_name = cfg.compr_model_name or "decoder"
+    decoder_model_name = cfg.decoder_model_name
+
     folder_name = f"{Hasher.hash(str(args))}"
     output_dir = f"{args.experiment_folder}/tmp_{folder_name}"
     model_output_dir = output_dir + "/train/"
-    lora = args.lora.lower() == "true"
 
     if accelerator.is_main_process:
-        run_name = f"{args.compressor_model_name}_{args.decoder_model_name}_{args.compression_rates}_QA_{lora}_{args.lr}_{folder_name}"
+        run_name = (
+            f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
+            f"{lora}_{args.lr}_{folder_name}"
+        )
         wandb.init(project="COCOM QA Finetune", name=run_name)
 
     dataset = datasets.load_dataset(args.dataset_RAG)
@@ -354,18 +376,10 @@ def main():
 
     del query_embedder
 
-    cfg = COCOMConfig(
-        decoder_model_name=args.decoder_model_name,
-        quantization="no",
-        generation_top_k=args.retriever_top_k,
-        sep=False,
-        compr_model_name=args.compressor_model_name,
-        compr_rates=args.compression_rates,
-        compr_linear_type=args.compression_linear_type,
-        lora=lora,
-    )
-
-    model = COCOM(cfg)
+    if args.checkpoint_path:
+        model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
+    else:
+        model = COCOM.from_pretrained(args.model_name_or_path, config=cfg)
     model.generation_top_k = args.retriever_top_k
 
     if accelerator.is_main_process:
