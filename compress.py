@@ -36,6 +36,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contexts_out", help="Directory to save compressed contexts", default="data/contexts")
     parser.add_argument("--embeddings_out", help="Directory to save document embeddings", default="data/embeddings")
     parser.add_argument(
+        "--use-bandit",
+        dest="use_bandit",
+        action="store_true",
+        help="Enable the bandit agent for dynamic compression rates (default)",
+    )
+    parser.add_argument(
+        "--no-use-bandit",
+        dest="use_bandit",
+        action="store_false",
+        help="Disable the bandit agent and use a fixed compression rate",
+    )
+    parser.set_defaults(use_bandit=True)
+    parser.add_argument(
         "--bandit-agent",
         default="bandit_ckpt/bandit_agent.pkl",
         help="Path to the trained bandit agent pickle (e.g., bandit_ckpt/bandit_agent.pkl)",
@@ -367,7 +380,7 @@ def main() -> None:
 
     agent = None
     agent_name = "None"
-    if args.bandit_agent:
+    if args.use_bandit and args.bandit_agent:
         bandit_path = args.bandit_agent
         if os.path.isdir(bandit_path):
             bandit_path = os.path.join(bandit_path, "bandit_agent.pkl")
@@ -380,6 +393,8 @@ def main() -> None:
             print(
                 f"Bandit agent not found at {bandit_path}; proceeding with fixed compression rate."
             )
+    elif not args.use_bandit:
+        print("Bandit agent disabled via --no-use-bandit flag; using fixed compression rate.")
     if agent is None:
         print("No bandit agent active; using a single compression rate during generation.")
 
