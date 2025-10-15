@@ -22,7 +22,18 @@ def get_fine_tuning_args():
     parser.add_argument("--gradient_accumulation", type=int, default=4)
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--num_save_steps", type=int, default=1)
+    parser.add_argument(
+        "--eval_every_steps",
+        type=int,
+        default=50,
+        help="Run evaluation and display metrics every N training steps. Set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--save_every_steps",
+        type=int,
+        default=200,
+        help="Overwrite the fine-tuned model checkpoint every N training steps. Set to 0 to disable.",
+    )
     parser.add_argument(
         "--compression_rates",
         type=int,
