@@ -14,12 +14,28 @@ from datasets import load_dataset
 from rouge_score import rouge_scorer
 from tqdm import tqdm
 from transformers import (
+    AutoConfig,
     AutoModelForCausalLM,
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     PreTrainedModel,
     PreTrainedTokenizerBase,
 )
+
+try:  # pragma: no cover - optional dependency for local custom models
+    from modeling_cocom import COCOM, COCOMConfig
+
+    try:
+        AutoConfig.register("cocom", COCOMConfig)  # type: ignore[arg-type]
+    except ValueError:
+        pass
+    try:
+        AutoModelForCausalLM.register(COCOMConfig, COCOM)  # type: ignore[arg-type]
+    except ValueError:
+        pass
+except ImportError:  # pragma: no cover - modeling file not always present
+    COCOM = None
+    COCOMConfig = None
 
 MODEL_SPECS = [
     ("adaptive", "ielabgroup/tinyllama-compression-multi-rate-4-16-128", None, "adaptive"),
