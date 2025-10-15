@@ -88,6 +88,44 @@ def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
 from tqdm import tqdm
 
 
+def resolve_base_compression_rate(model: COCOM, fallback_rate: int) -> int:
+    """Determine the compression rate to use when no bandit agent is present."""
+
+    compr_rates = getattr(model, "compr_rates", None)
+    if compr_rates:
+        # Normalise to integers if possible
+        try:
+            normalised_rates = [int(rate) for rate in compr_rates]
+        except Exception:
+            normalised_rates = list(compr_rates)
+
+        if len(normalised_rates) == 1:
+            return normalised_rates[0]
+
+        if fallback_rate in normalised_rates:
+            return fallback_rate
+
+        current_rate = getattr(model, "current_rate", None)
+        if current_rate is not None:
+            try:
+                current_rate_int = int(current_rate)
+            except Exception:
+                current_rate_int = current_rate
+            if current_rate_int in normalised_rates:
+                return current_rate_int
+
+        return normalised_rates[0]
+
+    current_rate = getattr(model, "current_rate", None)
+    if current_rate is not None:
+        try:
+            return int(current_rate)
+        except Exception:
+            return current_rate
+
+    return fallback_rate
+
+
 def generate_contexts(
         docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
 ) -> Dict[int, Dict[str, Any]]:
@@ -98,6 +136,17 @@ def generate_contexts(
 
     contexts: Dict[int, Dict[str, Any]] = {}
     agent = getattr(model, "bandit_agent", None)
+    agent_name = agent.__class__.__name__ if agent is not None else "None"
+
+    print(
+        f"Generating contexts with agent={agent_name} and base compression rate={fallback_rate}"
+    )
+
+    if agent is None and hasattr(model, "current_rate"):
+        try:
+            model.current_rate = int(fallback_rate)
+        except Exception:
+            model.current_rate = fallback_rate
 
     # Add progress bar
     pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
@@ -150,7 +199,7 @@ def generate_contexts(
             contexts[doc_id]["length"] = length
 
         # Update progress description
-        postfix = {"rate": selected_rate, "entropy": entropy}
+        postfix = {"rate": selected_rate, "entropy": entropy, "agent": agent_name}
         if length is not None:
             postfix["length"] = length
         pbar.set_postfix(postfix)
@@ -316,21 +365,28 @@ def main() -> None:
     model.eval()
     print(device)
 
+    agent = None
+    agent_name = "None"
     if args.bandit_agent:
         bandit_path = args.bandit_agent
         if os.path.isdir(bandit_path):
             bandit_path = os.path.join(bandit_path, "bandit_agent.pkl")
-        if not os.path.exists(bandit_path):
-            raise FileNotFoundError(
-                f"Bandit agent not found at {bandit_path}. Provide a valid path to bandit_agent.pkl"
+        if os.path.exists(bandit_path):
+            agent = load_bandit_agent(bandit_path, getattr(model, "compr_rates", []))
+            model.set_bandit_agent(agent)
+            agent_name = agent.__class__.__name__
+            print(f"Loaded bandit agent from {bandit_path}")
+        else:
+            print(
+                f"Bandit agent not found at {bandit_path}; proceeding with fixed compression rate."
             )
-        agent = load_bandit_agent(bandit_path, getattr(model, "compr_rates", []))
-        model.set_bandit_agent(agent)
-        print(f"Loaded bandit agent from {bandit_path}")
-    else:
-        print("No bandit agent provided; defaulting to fallback compression rate")
+    if agent is None:
+        print("No bandit agent active; using a single compression rate during generation.")
 
-    contexts = generate_contexts(docs, model, args.compression_rate)
+    base_rate = resolve_base_compression_rate(model, args.compression_rate)
+    print(f"Compression configuration -> agent={agent_name}, base_rate={base_rate}")
+
+    contexts = generate_contexts(docs, model, base_rate)
     contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.pt")
     print(
         "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
