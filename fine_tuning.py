@@ -284,7 +284,7 @@ def load_local_qa_splits(
         if len(train_examples) < 2:
             eval_examples = list(train_examples)
         else:
-            eval_count = max(1, int(round(len(train_examples) * 0.1)))
+            eval_count = min(16, int(round(len(train_examples) * 0.1)))
             eval_indices = set(random.sample(range(len(train_examples)), eval_count))
             eval_examples = [
                 example for idx, example in enumerate(train_examples) if idx in eval_indices
