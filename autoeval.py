@@ -12,14 +12,14 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from huggingface_hub import snapshot_download
 from rouge import Rouge
 from tqdm import tqdm
-from transformers import AutoTokenizer
 
 import evaluate
 from datasets import load_dataset as hf_load_dataset
@@ -134,14 +134,14 @@ def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def determine_default_max_length(tokenizer: AutoTokenizer, fallback: int = 2048) -> int:
+def determine_default_max_length(tokenizer: Any, fallback: int = 2048) -> int:
     max_len = getattr(tokenizer, "model_max_length", None)
     if max_len is None or max_len <= 0 or max_len > 32000:
         return fallback
     return int(max_len)
 
 
-def count_tokens(tokenizer: AutoTokenizer, text: str) -> int:
+def count_tokens(tokenizer: Any, text: str) -> int:
     tokens = tokenizer(text, add_special_tokens=False, return_attention_mask=False)
     token_ids = tokens.get("input_ids", [])
     return len(token_ids)
@@ -152,7 +152,7 @@ def synchronize_if_needed(device: torch.device) -> None:
         torch.cuda.synchronize(device)
 
 
-def clean_decoded_text(text: str, tokenizer: AutoTokenizer) -> str:
+def clean_decoded_text(text: str, tokenizer: Any) -> str:
     special_tokens = []
     for attr in ("ae_token", "mem_token", "enc_token", "sep_token"):
         token = getattr(tokenizer, attr, None)
@@ -162,6 +162,20 @@ def clean_decoded_text(text: str, tokenizer: AutoTokenizer) -> str:
     for token in special_tokens:
         cleaned = cleaned.replace(token, "")
     return cleaned.strip()
+
+
+def download_model_snapshot(model_id: str) -> Path:
+    cache_dir = snapshot_download(repo_id=model_id)
+    return Path(cache_dir)
+
+
+def load_cocom_model(model_id: str, device: torch.device) -> COCOM:
+    model_path = download_model_snapshot(model_id)
+    dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
+    model = COCOM.from_pretrained(model_path, torch_dtype=dtype, local_files_only=True)
+    model.to(device)
+    model.eval()
+    return model
 
 
 def prepare_inputs(
@@ -263,17 +277,13 @@ def compute_rouge(rouge_metric: Rouge, prediction: str, reference: str) -> float
 
 def evaluate_model(
     name: str,
-    model_id: str,
+    model: COCOM,
     default_rate: Optional[int],
     dataset: Sequence[Dict[str, str]],
     device: torch.device,
-    token_counter: AutoTokenizer,
+    token_counter: Any,
     save_dir: Path,
-) -> Tuple[List[ExampleResult], int]:
-    model = COCOM.from_pretrained(model_id, torch_dtype=torch.bfloat16 if device.type != "cpu" else torch.float32)
-    model.to(device)
-    model.eval()
-
+) -> List[ExampleResult]:
     ensure_dir(save_dir)
     log_path = save_dir / f"{name}.jsonl"
     rouge_metric = Rouge(metrics=["rouge-l"])
@@ -361,11 +371,7 @@ def evaluate_model(
                     + "\n"
                 )
 
-    num_examples = len(results)
-    del model
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-    return results, num_examples
+    return results
 
 
 def summarize_results(results: List[ExampleResult]) -> Dict[str, Dict[str, float]]:
@@ -469,17 +475,15 @@ def main() -> None:
     if not dataset:
         raise ValueError("Dataset is empty or could not be parsed.")
 
-    token_counter = AutoTokenizer.from_pretrained(
-        FIXED_MODEL_IDS["fixed_4"][0],
-        use_fast=True,
-    )
-
     all_results: Dict[str, List[ExampleResult]] = {}
     summaries: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    adaptive_results, _ = evaluate_model(
+    adaptive_model = load_cocom_model(ADAPTIVE_MODEL_ID, config.device)
+    token_counter = adaptive_model.decoder_tokenizer
+
+    adaptive_results = evaluate_model(
         name="adaptive",
-        model_id=ADAPTIVE_MODEL_ID,
+        model=adaptive_model,
         default_rate=None,
         dataset=dataset,
         device=config.device,
@@ -489,10 +493,15 @@ def main() -> None:
     all_results["adaptive"] = adaptive_results
     summaries["adaptive"] = summarize_results(adaptive_results)
 
+    del adaptive_model
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     for name, (model_id, rate) in FIXED_MODEL_IDS.items():
-        results, _ = evaluate_model(
+        model = load_cocom_model(model_id, config.device)
+        results = evaluate_model(
             name=name,
-            model_id=model_id,
+            model=model,
             default_rate=rate,
             dataset=dataset,
             device=config.device,
@@ -502,9 +511,13 @@ def main() -> None:
         all_results[name] = results
         summaries[name] = summarize_results(results)
 
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     save_summary(
         config.save_dir,
-        token_counter.name_or_path,
+        getattr(token_counter, "name_or_path", "unknown"),
         config.dataset_name,
         config.dataset_split,
         summaries,
