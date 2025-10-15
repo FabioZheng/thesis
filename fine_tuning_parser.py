@@ -23,6 +23,12 @@ def get_fine_tuning_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.05)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument(
+        "--epochs",
+        type=int,
+        default=1,
+        help="Number of times to iterate over the local QA dataset during fine-tuning.",
+    )
+    parser.add_argument(
         "--eval_every_steps",
         type=int,
         default=50,

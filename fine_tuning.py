@@ -735,6 +735,8 @@ def main():
     eval_steps = max(args.eval_every_steps, 1)
     logging_steps = max(args.eval_every_steps if args.eval_every_steps > 0 else 10, 1)
 
+    epochs = max(args.epochs, 1)
+
     training_args = TrainingArguments(
         output_dir=model_output_dir,
         learning_rate=args.lr,
@@ -752,6 +754,7 @@ def main():
         remove_unused_columns=False,
         logging_steps=logging_steps,
         eval_steps=eval_steps,
+        num_train_epochs=epochs,
     )
 
     accelerator = Accelerator()
@@ -759,7 +762,7 @@ def main():
     world_size = max(accelerator.num_processes, 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
     steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
-    total_steps = steps_per_epoch
+    total_steps = steps_per_epoch * epochs
 
     trainer = FineTuningTrainer(
         model=model,
