@@ -22,12 +22,14 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 import evaluate
+from datasets import load_dataset as hf_load_dataset
 
 from modeling_cocom import COCOM
 from utils import prepare_auto_encoding
 
 
-DEFAULT_DATA_PATH = Path("data/docs.json")
+DEFAULT_DATASET_NAME = "wshuai190/kilt-128"
+DEFAULT_DATASET_SPLIT = "train"
 ADAPTIVE_MODEL_ID = "ielabgroup/tinyllama-compression-multi-rate-4-16-128"
 FIXED_MODEL_IDS = {
     "fixed_4": ("ielabgroup/tinyllama-compression-single-rate-4", 4),
@@ -38,7 +40,8 @@ FIXED_MODEL_IDS = {
 
 @dataclass
 class EvaluationConfig:
-    dataset_path: Path
+    dataset_name: str
+    dataset_split: str
     max_samples: Optional[int]
     save_dir: Path
     device: torch.device
@@ -66,7 +69,18 @@ class ExampleResult:
 
 def parse_args() -> EvaluationConfig:
     parser = argparse.ArgumentParser(description="Autoencoding compression evaluation")
-    parser.add_argument("--dataset", type=Path, default=DEFAULT_DATA_PATH, help="Path to docs.json")
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default=DEFAULT_DATASET_NAME,
+        help="Hugging Face dataset name (default: wshuai190/kilt-128)",
+    )
+    parser.add_argument(
+        "--split",
+        type=str,
+        default=DEFAULT_DATASET_SPLIT,
+        help="Dataset split to evaluate (default: train)",
+    )
     parser.add_argument("--max_samples", type=int, default=None, help="Maximum number of samples to evaluate")
     parser.add_argument("--save_dir", type=Path, default=Path("results"), help="Directory to save outputs")
     parser.add_argument("--device", default=None, choices=["cpu", "cuda"], help="Computation device")
@@ -84,7 +98,8 @@ def parse_args() -> EvaluationConfig:
         device = torch.device(args.device)
 
     return EvaluationConfig(
-        dataset_path=args.dataset,
+        dataset_name=args.dataset,
+        dataset_split=args.split,
         max_samples=args.max_samples,
         save_dir=args.save_dir,
         device=device,
@@ -92,32 +107,25 @@ def parse_args() -> EvaluationConfig:
     )
 
 
-def load_dataset(path: Path, max_samples: Optional[int]) -> List[Dict[str, str]]:
-    with path.open("r", encoding="utf-8") as f:
-        data = json.load(f)
-
-    records: List[Dict[str, str]] = []
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if not isinstance(value, str):
-                continue
-            records.append({"id": str(key), "text": value})
-    elif isinstance(data, list):
-        for obj in data:
-            if not isinstance(obj, dict):
-                continue
-            text = obj.get("text")
-            if text is None:
-                continue
-            doc = {"text": text}
-            if "id" in obj:
-                doc["id"] = str(obj["id"])
-            records.append(doc)
-    else:
-        raise ValueError("Unsupported dataset format: expected list or dict")
+def load_dataset_records(dataset_name: str, split: str, max_samples: Optional[int]) -> List[Dict[str, str]]:
+    dataset = hf_load_dataset(dataset_name, split=split)
 
     if max_samples is not None:
-        records = records[:max_samples]
+        max_samples = min(max_samples, len(dataset))
+        dataset = dataset.select(range(max_samples))
+
+    records: List[Dict[str, str]] = []
+    for example in dataset:
+        text = example.get("text")
+        if text is None:
+            continue
+
+        record: Dict[str, str] = {"text": text}
+        for candidate in ("id", "doc_id", "uid"):
+            if candidate in example and example[candidate] is not None:
+                record["id"] = str(example[candidate])
+                break
+        records.append(record)
 
     return records
 
@@ -401,10 +409,16 @@ def summarize_results(results: List[ExampleResult]) -> Dict[str, Dict[str, float
 def save_summary(
     save_dir: Path,
     tokenizer_name: str,
+    dataset_name: str,
+    dataset_split: str,
     model_summaries: Dict[str, Dict[str, Dict[str, float]]],
 ) -> None:
     payload = {
         "tokenizer": tokenizer_name,
+        "dataset": {
+            "name": dataset_name,
+            "split": dataset_split,
+        },
         "conditions": model_summaries,
     }
     summary_path = save_dir / "summary.json"
@@ -451,7 +465,7 @@ def main() -> None:
     config = parse_args()
     ensure_dir(config.save_dir)
 
-    dataset = load_dataset(config.dataset_path, config.max_samples)
+    dataset = load_dataset_records(config.dataset_name, config.dataset_split, config.max_samples)
     if not dataset:
         raise ValueError("Dataset is empty or could not be parsed.")
 
@@ -488,7 +502,13 @@ def main() -> None:
         all_results[name] = results
         summaries[name] = summarize_results(results)
 
-    save_summary(config.save_dir, token_counter.name_or_path, summaries)
+    save_summary(
+        config.save_dir,
+        token_counter.name_or_path,
+        config.dataset_name,
+        config.dataset_split,
+        summaries,
+    )
     plot_rd_curve(config.save_dir, all_results, config.plot_bertscore)
 
 
