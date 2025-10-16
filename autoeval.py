@@ -9,6 +9,7 @@ logs, an aggregated summary JSON, and an RD curve plot.
 import argparse
 import json
 import math
+import pickle
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,8 @@ from tqdm import tqdm
 import evaluate
 from datasets import load_dataset as hf_load_dataset
 
+from cmab_agent import CompressionBanditAgent
+from metrics import batch_entropy
 from modeling_cocom import COCOM
 from utils import prepare_auto_encoding
 
@@ -36,6 +39,7 @@ FIXED_MODEL_IDS = {
     "fixed_16": ("ielabgroup/tinyllama-compression-single-rate-16", 16),
     "fixed_128": ("ielabgroup/tinyllama-compression-single-rate-128", 128),
 }
+BANDIT_AGENT_PATH = Path(__file__).resolve().parent / "bandit_ckpt" / "bandit_agent.pkl"
 
 
 @dataclass
@@ -178,6 +182,31 @@ def load_cocom_model(model_id: str, device: torch.device) -> COCOM:
     return model
 
 
+def load_bandit_agent(agent_path: Path, rates: Sequence[int]) -> CompressionBanditAgent:
+    if not agent_path.is_file():
+        raise FileNotFoundError(f"Bandit agent checkpoint not found at {agent_path}")
+
+    with agent_path.open("rb") as fh:
+        data = pickle.load(fh)
+
+    try:
+        agent_rates = [int(r) for r in data.get("rates", rates) or rates]
+    except Exception:
+        agent_rates = list(data.get("rates", rates) or rates)
+
+    alpha = float(data.get("alpha", 1.0))
+    use_length = bool(data.get("use_length_feature", False))
+
+    agent = CompressionBanditAgent(agent_rates, alpha=alpha, use_length_feature=use_length)
+
+    if "A" in data:
+        agent.A = data["A"]
+    if "b" in data:
+        agent.b = data["b"]
+
+    return agent
+
+
 def prepare_inputs(
     model: COCOM,
     text: str,
@@ -213,10 +242,41 @@ def autoencode_example(
     rate: int,
     device: torch.device,
     max_new_tokens: int = 512,
-) -> Tuple[str, int, float, float]:
-    compressor_tokenizer = model.compr.tokenizer if getattr(model, "compr", None) is not None else model.decoder_tokenizer
+) -> Tuple[str, int, float, float, int]:
+    compressor_tokenizer = (
+        model.compr.tokenizer if getattr(model, "compr", None) is not None else model.decoder_tokenizer
+    )
     max_length = determine_default_max_length(compressor_tokenizer)
-    inputs = prepare_inputs(model, text, rate, max_length)
+
+    # Select a compression rate using the contextual bandit agent when available.
+    agent = getattr(model, "bandit_agent", None)
+    selected_rate = rate
+    if agent is not None:
+        entropy_tokens = compressor_tokenizer(
+            text,
+            return_attention_mask=False,
+            return_tensors=None,
+            add_special_tokens=False,
+        )
+        token_ids = entropy_tokens.get("input_ids", [])
+        truncated_len = min(len(token_ids), max_length)
+        if truncated_len > 0:
+            token_slice = token_ids[:truncated_len]
+            entropy_input_ids = torch.tensor([token_slice], dtype=torch.long)
+            entropy_attention_mask = torch.ones_like(entropy_input_ids)
+            entropies = batch_entropy(entropy_input_ids, entropy_attention_mask)
+            avg_entropy = float(sum(entropies) / len(entropies)) if entropies else 0.0
+            avg_length = (
+                float(entropy_attention_mask.sum().item())
+                if getattr(agent, "use_length_feature", False)
+                else None
+            )
+        else:
+            avg_entropy = 0.0
+            avg_length = 0.0 if getattr(agent, "use_length_feature", False) else None
+        selected_rate = agent.select_rate(avg_entropy, avg_length)
+
+    inputs = prepare_inputs(model, text, selected_rate, max_length)
 
     enc_input_ids = inputs["enc_input_ids"].to(device)
     enc_attention_mask = inputs["enc_attention_mask"].to(device)
@@ -225,7 +285,7 @@ def autoencode_example(
 
     if not hasattr(model, "current_rate"):
         raise AttributeError("Model does not expose current_rate")
-    model.current_rate = rate
+    model.current_rate = selected_rate
 
     with torch.no_grad():
         synchronize_if_needed(device)
@@ -233,7 +293,7 @@ def autoencode_example(
         compressed_embs = model.compr(
             enc_input_ids,
             enc_attention_mask,
-            rate=rate,
+            rate=selected_rate,
         )
         synchronize_if_needed(device)
         encode_time = time.perf_counter() - encode_start
@@ -256,7 +316,7 @@ def autoencode_example(
     decoded = model.decoder_tokenizer.batch_decode(output_ids, skip_special_tokens=False)[0]
     decoded = clean_decoded_text(decoded, model.decoder_tokenizer)
     compressed_tokens = compressed_embs.shape[1]
-    return decoded, compressed_tokens, encode_time, decode_time
+    return decoded, compressed_tokens, encode_time, decode_time, selected_rate
 
 
 def warmup_model(model: COCOM, text: str, rate: int, device: torch.device) -> None:
@@ -309,7 +369,9 @@ def evaluate_model(
                 rate = int(getattr(model, "current_rate", 4))
 
             try:
-                decoded, tokens_out, encode_time, decode_time = autoencode_example(model, text, rate, device)
+                decoded, tokens_out, encode_time, decode_time, used_rate = autoencode_example(
+                    model, text, rate, device
+                )
             except Exception as exc:  # pragma: no cover - best effort logging
                 error_record = {
                     "id": doc_id,
@@ -328,7 +390,7 @@ def evaluate_model(
                 doc_id=doc_id,
                 text=text,
                 reconstruction=decoded,
-                compression_rate=rate,
+                compression_rate=used_rate,
                 tokens_in=tokens_in,
                 tokens_out=tokens_out,
                 compression_ratio=compression_ratio,
@@ -479,6 +541,20 @@ def main() -> None:
     summaries: Dict[str, Dict[str, Dict[str, float]]] = {}
 
     adaptive_model = load_cocom_model(ADAPTIVE_MODEL_ID, config.device)
+
+    if hasattr(adaptive_model, "set_bandit_agent"):
+        raw_rates = getattr(adaptive_model, "compr_rates", [])
+        try:
+            agent_rates = [int(r) for r in raw_rates]
+        except Exception:
+            agent_rates = list(raw_rates)
+        try:
+            agent = load_bandit_agent(BANDIT_AGENT_PATH, agent_rates)
+        except FileNotFoundError as exc:
+            print(f"[autoeval] Warning: {exc}")
+        else:
+            adaptive_model.set_bandit_agent(agent)
+
     token_counter = adaptive_model.decoder_tokenizer
 
     adaptive_results = evaluate_model(
