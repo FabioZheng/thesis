@@ -57,18 +57,20 @@ def _load_first_context(path: Path) -> Tuple[str, torch.Tensor, Dict[str, Any]]:
     return str(first_key), context.to(torch.float32), metadata
 
 
-def _build_prompt(tokenizer, mem_tokens: int, question: str) -> Dict[str, torch.Tensor]:
+def _build_autoencoding_prompt(tokenizer, mem_tokens: int) -> Dict[str, torch.Tensor]:
+    """Mimic the auto-encoding setup by feeding only memory tokens to the decoder."""
+
+    ae_symbol = getattr(tokenizer, "ae_token", "") or ""
     bos = tokenizer.bos_token or ""
     mem_symbol = getattr(tokenizer, "mem_token", None)
     if not mem_symbol:
         raise ValueError("Decoder tokenizer does not define a memory token symbol.")
 
-    mem_block = mem_symbol * mem_tokens
-    prompt = f"{bos}{mem_block}[INST]{question}\n[/INST]\n"
+    prompt = f"{ae_symbol}{bos}{mem_symbol * mem_tokens}"
     encoded = tokenizer(
         prompt,
         return_tensors="pt",
-        padding="longest",
+        padding=False,
         truncation=False,
         add_special_tokens=False,
     )
@@ -78,7 +80,6 @@ def _build_prompt(tokenizer, mem_tokens: int, question: str) -> Dict[str, torch.
 def decode_first_context(
     context_path: Path,
     model_source: str,
-    question: str,
     max_new_tokens: int,
 ) -> None:
     doc_id, context, metadata = _load_first_context(context_path)
@@ -90,7 +91,7 @@ def decode_first_context(
     model.eval()
 
     mem_tokens = context.size(0)
-    prompt = _build_prompt(model.decoder_tokenizer, mem_tokens, question)
+    prompt = _build_autoencoding_prompt(model.decoder_tokenizer, mem_tokens)
 
     dec_input_ids = prompt["input_ids"].to(device)
     dec_attention_mask = prompt["attention_mask"].to(device)
@@ -136,11 +137,6 @@ def main() -> None:
         help="Hugging Face model identifier to load the decoder from instead of a local checkpoint.",
     )
     parser.add_argument(
-        "--question",
-        default="Please reconstruct the stored passage.",
-        help="Instruction appended after the memory tokens to guide generation.",
-    )
-    parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
@@ -158,7 +154,6 @@ def main() -> None:
     decode_first_context(
         context_path=context_path,
         model_source=model_source,
-        question=args.question,
         max_new_tokens=args.max_new_tokens,
     )
 
