@@ -751,7 +751,11 @@ def main():
         num_train_epochs=epochs,
     )
 
-    world_size = max(accelerator.num_processes, 1)
+    try:
+        inferred_world_size = int(getattr(accelerator.state, "num_processes", 1))
+    except AttributeError:
+        inferred_world_size = 1
+    world_size = max(inferred_world_size, 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
 
     trainer: Optional[FineTuningTrainer] = None
