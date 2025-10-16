@@ -77,7 +77,16 @@ pip3 install -r requirements.txt
 
 # Fine-tuning
 
-Coming soon...
+### Why LoRA is enabled by default
+The QA fine-tuning entrypoint (`fine_tuning.py`) reads its hyperparameters from a
+`COCOMConfig` checkpoint before training begins. That configuration ships with
+`"lora": true`, so the model constructor wraps the decoder with LoRA adapters as soon
+as the run starts unless you explicitly override the flag.
+
+This default keeps the number of trainable parameters small, which is important when
+the decoder is a 7B-parameter model—training only the low-rank adapters lets you fine-tune
+on commodity GPUs while leaving the base weights frozen. You can disable the adapters by
+passing `--lora False` on the CLI when you need a full-model update.
 ### COCOM 
 To train the `COCOM` model based on `Mistral-7B-Instruct-v0.2 ` with compression rate `128`. We used 8x A100 80GB for pre-training.
 

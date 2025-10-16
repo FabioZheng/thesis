@@ -47,7 +47,15 @@ def get_fine_tuning_args():
         default=None,
         help="Optional override for compression rates when not using the pretrained configuration values.",
     )
-    parser.add_argument("--lora", type=str, default="False")
+    parser.add_argument(
+        "--lora",
+        type=str,
+        default=None,
+        help=(
+            "Override the LoRA configuration. Use 'True' or 'False'. "
+            "When omitted, the value stored in the loaded model config is kept."
+        ),
+    )
     parser.add_argument("--experiment_folder", type=str, default="experiments_compress_real")
     parser.add_argument("--dataset_name_or_dir", type=str, default="openwebtext")
     parser.add_argument(

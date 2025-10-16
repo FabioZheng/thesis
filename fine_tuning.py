@@ -641,7 +641,15 @@ def main():
         raise ValueError("Either --model_name_or_path or --checkpoint_path must be provided.")
 
     cfg = COCOMConfig.from_pretrained(model_source)
-    lora = args.lora.lower() == "true"
+
+    def _parse_lora_flag(value: Optional[object], default: bool) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).lower() == "true"
+
+    lora = _parse_lora_flag(args.lora, cfg.lora)
 
     if args.compression_rates is not None:
         cfg.compr_rates = list(args.compression_rates)
@@ -662,6 +670,13 @@ def main():
     final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
     save_log_path = os.path.join(args.experiment_folder, "save_log.jsonl")
 
+    checkpoint_abs_path = (
+        os.path.abspath(args.checkpoint_path)
+        if args.checkpoint_path is not None
+        else None
+    )
+    final_model_abs_path = os.path.abspath(final_model_dir)
+
     if accelerator.is_main_process:
         run_name = (
             f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
@@ -671,7 +686,7 @@ def main():
         os.makedirs(args.experiment_folder, exist_ok=True)
         if os.path.exists(tmp_output_dir):
             shutil.rmtree(tmp_output_dir)
-        if os.path.exists(final_model_dir):
+        if os.path.exists(final_model_dir) and final_model_abs_path != checkpoint_abs_path:
             shutil.rmtree(final_model_dir)
         if os.path.exists(save_log_path):
             os.remove(save_log_path)
