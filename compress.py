@@ -1,7 +1,7 @@
 import argparse
-import os
 import pickle
-from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 import numpy as np
@@ -12,7 +12,7 @@ from train_cmab import load_model_safely
 from cmab_agent import CompressionBanditAgent
 from metrics import batch_entropy
 from utils import pad_tokens_to_rate
-from save_json import load_and_flatten, save_json, save_queries_json, save_answers_json
+from save_json import load_and_flatten, save_answers_json, save_json, save_queries_json
 
 
 def parse_args() -> argparse.Namespace:
@@ -76,25 +76,18 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
+def load_bandit_agent(path: str, rates: Iterable[int]) -> CompressionBanditAgent:
     with open(path, "rb") as f:
         agent_data = pickle.load(f)
 
-    agent_rates = agent_data.get("rates", rates)
-    agent_alpha = agent_data.get("alpha", 1.0)
-    agent_use_length = agent_data.get("use_length_feature", False)
     agent = CompressionBanditAgent(
-        agent_rates,
-        alpha=agent_alpha,
-        use_length_feature=agent_use_length,
+        list(agent_data.get("rates", list(rates))),
+        alpha=agent_data.get("alpha", 1.0),
+        use_length_feature=agent_data.get("use_length_feature", False),
     )
 
-    # Restore learned parameters if available
-    if "A" in agent_data:
-        agent.A = agent_data["A"]
-    if "b" in agent_data:
-        agent.b = agent_data["b"]
-
+    agent.A = agent_data.get("A", agent.A)
+    agent.b = agent_data.get("b", agent.b)
     return agent
 
 
@@ -140,17 +133,22 @@ def resolve_base_compression_rate(model: COCOM, fallback_rate: int) -> int:
 
 
 def generate_contexts(
-        docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
+    docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
 ) -> Dict[int, Dict[str, Any]]:
-    try:
-        device = next(model.parameters()).device
-    except StopIteration:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    first_param = next(model.parameters(), None)
+    device = first_param.device if first_param is not None else torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
 
-    contexts: Dict[int, Dict[str, Any]] = {}
+    tokenizer = model.compr.tokenizer
+    pad_token_id = (
+        tokenizer.pad_token_id
+        if tokenizer.pad_token_id is not None
+        else tokenizer.eos_token_id or 0
+    )
+
     agent = getattr(model, "bandit_agent", None)
     agent_name = agent.__class__.__name__ if agent is not None else "None"
-
     print(
         f"Generating contexts with agent={agent_name} and base compression rate={fallback_rate}"
     )
@@ -161,61 +159,60 @@ def generate_contexts(
         except Exception:
             model.current_rate = fallback_rate
 
-    # Add progress bar
+    contexts: Dict[int, Dict[str, Any]] = {}
     pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
 
-    for doc_id, item in pbar:
-        tokens = model.compr.tokenizer(
-            item["text"],
-            return_tensors="pt",
-            truncation=True,
-            max_length=512,
-            padding="max_length",  # Add padding to fix size issues
-        )
-        selected_rate = fallback_rate
-        entropy: Optional[float] = None
-        length: Optional[float] = None
-        if agent is not None:
-            entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
-            if agent.use_length_feature:
-                length = float(tokens["attention_mask"].sum().item())
-            try:
-                selected_rate = agent.select_rate(float(entropy), length)
-            except Exception:
-                selected_rate = fallback_rate
-
-        pad_token_id = model.compr.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = (
-                model.compr.tokenizer.eos_token_id
-                if model.compr.tokenizer.eos_token_id is not None
-                else 0
+    with torch.no_grad():
+        for doc_id, item in pbar:
+            tokens = tokenizer(
+                item["text"],
+                return_tensors="pt",
+                truncation=True,
             )
-        tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
-        tokens = {k: v.to(device) for k, v in tokens.items()}
 
-        with torch.no_grad():
+            selected_rate = fallback_rate
+            entropy: Optional[float] = None
+            length: Optional[float] = None
+
+            if agent is not None:
+                attention_mask = tokens["attention_mask"]
+                entropy = float(
+                    batch_entropy(tokens["input_ids"], attention_mask)[0]
+                )
+                if agent.use_length_feature:
+                    length = float(attention_mask.sum().item())
+                try:
+                    selected_rate = agent.select_rate(entropy, length)
+                except Exception:
+                    selected_rate = fallback_rate
+
+            tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
+            tokens = {k: v.to(device) for k, v in tokens.items()}
+
             emb = model.compr(
                 input_ids=tokens["input_ids"],
                 attention_mask=tokens["attention_mask"],
                 rate=selected_rate,
             )
-        context_tensor = emb.detach().cpu()
-        contexts[doc_id] = {
-            "query_id": item["query_id"],
-            "context": context_tensor,
-            "compression_rate": selected_rate,
-        }
-        if entropy is not None:
-            contexts[doc_id]["entropy"] = entropy
-        if length is not None:
-            contexts[doc_id]["length"] = length
+            context_tensor = emb.detach().cpu()
 
-        # Update progress description
-        postfix = {"rate": selected_rate, "entropy": entropy, "agent": agent_name}
-        if length is not None:
-            postfix["length"] = length
-        pbar.set_postfix(postfix)
+            record: Dict[str, Any] = {
+                "query_id": item["query_id"],
+                "context": context_tensor,
+                "compression_rate": selected_rate,
+            }
+            if entropy is not None:
+                record["entropy"] = entropy
+            if length is not None:
+                record["length"] = length
+            contexts[doc_id] = record
+
+            postfix = {"rate": selected_rate, "agent": agent_name}
+            if entropy is not None:
+                postfix["entropy"] = entropy
+            if length is not None:
+                postfix["length"] = length
+            pbar.set_postfix(postfix)
 
     return contexts
 
@@ -235,27 +232,28 @@ def _estimate_context_memory_mb(contexts: Dict[int, Dict[str, Any]]) -> float:
 def save_contexts(
     contexts: Dict[int, Dict[str, Any]], directory: str, filename: str = "contexts.pt"
 ) -> Tuple[str, Dict[str, Any]]:
-    os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
+    path = Path(directory, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
 
     serialisable_contexts: Dict[int, Dict[str, Any]] = {}
     for doc_id, payload in contexts.items():
         context = payload.get("context")
         if context is None:
             raise ValueError(f"Missing context tensor for document id {doc_id}")
-        tensor_context = context.cpu() if isinstance(context, torch.Tensor) else torch.as_tensor(context)
-        serialisable_contexts[doc_id] = {
-            **payload,
-            "context": tensor_context,
-        }
+        tensor_context = (
+            context.detach().cpu()
+            if isinstance(context, torch.Tensor)
+            else torch.as_tensor(context)
+        )
+        serialisable_contexts[doc_id] = {**payload, "context": tensor_context}
 
     torch.save(serialisable_contexts, path)
 
     memory_stats: Dict[str, Any] = {
         "approx_memory_mb": _estimate_context_memory_mb(serialisable_contexts),
-        "pt_disk_mb": os.path.getsize(path) / (1024 * 1024),
+        "pt_disk_mb": path.stat().st_size / (1024 * 1024),
     }
-    return path, memory_stats
+    return str(path), memory_stats
 
 
 def generate_embeddings(
@@ -293,8 +291,8 @@ def save_embeddings_npz(
     filename: str = "embeddings.npz",
 ) -> Tuple[str, Dict[str, Any]]:
     """Persist embeddings alongside their document and query identifiers."""
-    os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, filename)
+    output_path = Path(output_dir, filename)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
         doc_ids=doc_ids,
@@ -302,73 +300,74 @@ def save_embeddings_npz(
         embeddings=embeddings,
     )
 
-    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
     memory_stats: Dict[str, Any] = {
         "embeddings_shape": tuple(int(dim) for dim in embeddings.shape),
-        "approx_disk_mb": file_size_mb,
+        "approx_disk_mb": output_path.stat().st_size / (1024 * 1024),
     }
-    return output_path, memory_stats
+    return str(output_path), memory_stats
 
 
-def main() -> None:
-    args = parse_args()
+def _print_export_stats(
+    label: str,
+    count: int,
+    path: str,
+    stats: Dict[str, Any],
+) -> None:
+    print(
+        "Extracted {count} {label} -> {path} (approx memory: {mem:.2f} MB, "
+        "pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+            count=count,
+            label=label,
+            path=path,
+            mem=stats.get("approx_memory_mb", 0.0),
+            pickle=stats.get("pickle_disk_mb", 0.0),
+            json=stats.get("json_disk_mb", 0.0),
+        )
+    )
 
-    docs = load_and_flatten(args.dataset, limit=args.limit)
+
+def prepare_documents(
+    dataset_path: str, output_dir: str, limit: Optional[int]
+) -> Dict[int, Dict[str, str]]:
+    docs = load_and_flatten(dataset_path, limit=limit)
     docs = {
         doc_id: {k: v for k, v in payload.items() if k in ("query_id", "text")}
         for doc_id, payload in docs.items()
     }
-    docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
-    print(
-        "Extracted {count} MS MARCO passages -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=len(docs),
-            path=docs_path,
-            mem=docs_mem.get("approx_memory_mb", 0.0),
-            pickle=docs_mem.get("pickle_disk_mb", 0.0),
-            json=docs_mem.get("json_disk_mb", 0.0),
-        )
-    )
+
+    docs_path, docs_mem = save_json(docs, output_dir, "docs.json")
+    _print_export_stats("MS MARCO passages", len(docs), docs_path, docs_mem)
 
     query_ids = {
         payload["query_id"]
         for payload in docs.values()
         if payload.get("query_id") is not None
     }
+
     queries_path, queries_mem = save_queries_json(
-        args.dataset,
-        args.docs_out,
+        dataset_path,
+        output_dir,
         "queries.json",
         query_ids=query_ids or None,
     )
-    print(
-        "Extracted {count} queries -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=queries_mem.get("count", 0),
-            path=queries_path,
-            mem=queries_mem.get("approx_memory_mb", 0.0),
-            pickle=queries_mem.get("pickle_disk_mb", 0.0),
-            json=queries_mem.get("json_disk_mb", 0.0),
-        )
+    _print_export_stats(
+        "queries", queries_mem.get("count", 0), queries_path, queries_mem
     )
 
     answers_path, answers_mem = save_answers_json(
-        args.dataset,
-        args.docs_out,
+        dataset_path,
+        output_dir,
         "answers.json",
         query_ids=query_ids or None,
     )
-    print(
-        "Extracted {count} answers -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=answers_mem.get("count", 0),
-            path=answers_path,
-            mem=answers_mem.get("approx_memory_mb", 0.0),
-            pickle=answers_mem.get("pickle_disk_mb", 0.0),
-            json=answers_mem.get("json_disk_mb", 0.0),
-        )
+    _print_export_stats(
+        "answers", answers_mem.get("count", 0), answers_path, answers_mem
     )
 
+    return docs
+
+
+def configure_model_and_agent(args: argparse.Namespace) -> Tuple[COCOM, str, int]:
     if args.checkpoint and args.hf_model_name:
         raise ValueError("Specify either --checkpoint or --hf_model_name, not both")
 
@@ -377,20 +376,25 @@ def main() -> None:
         raise ValueError("You must provide either --checkpoint or --hf_model_name")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device {device}")
+
     model = load_model_safely(model_source)
     model.to(device)
     model.eval()
-    print(device)
 
-    agent = None
     agent_name = "None"
     if args.use_bandit and args.bandit_agent:
-        bandit_path = args.bandit_agent
-        if os.path.isdir(bandit_path):
-            bandit_path = os.path.join(bandit_path, "bandit_agent.pkl")
-        if os.path.exists(bandit_path):
-            agent = load_bandit_agent(bandit_path, getattr(model, "compr_rates", []))
-            model.set_bandit_agent(agent)
+        bandit_path = Path(args.bandit_agent)
+        if bandit_path.is_dir():
+            bandit_path = bandit_path / "bandit_agent.pkl"
+        if bandit_path.exists():
+            agent = load_bandit_agent(
+                bandit_path.as_posix(), getattr(model, "compr_rates", [])
+            )
+            if hasattr(model, "set_bandit_agent"):
+                model.set_bandit_agent(agent)
+            else:
+                setattr(model, "bandit_agent", agent)
             agent_name = agent.__class__.__name__
             print(f"Loaded bandit agent from {bandit_path}")
         else:
@@ -399,11 +403,23 @@ def main() -> None:
             )
     elif not args.use_bandit:
         print("Bandit agent disabled via --no-use-bandit flag; using fixed compression rate.")
-    if agent is None:
+
+    if getattr(model, "bandit_agent", None) is None:
         print("No bandit agent active; using a single compression rate during generation.")
 
     base_rate = resolve_base_compression_rate(model, args.compression_rate)
     print(f"Compression configuration -> agent={agent_name}, base_rate={base_rate}")
+
+    setattr(model, "current_rate", base_rate)
+    return model, model_source, base_rate
+
+
+def main() -> None:
+    args = parse_args()
+
+    docs = prepare_documents(args.dataset, args.docs_out, args.limit)
+
+    model, model_source, base_rate = configure_model_and_agent(args)
 
     contexts = generate_contexts(docs, model, base_rate)
     contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.pt")
