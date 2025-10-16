@@ -11,7 +11,6 @@ import numpy as np
 import torch
 from accelerate import Accelerator
 from torch.utils.data import Dataset
-from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments, TrainerCallback
 from analyse.retrieval import CosineRetriever, TextEmbedder
 from fine_tuning_parser import get_fine_tuning_args
@@ -315,7 +314,7 @@ class RAGFineTuneDataset(Dataset):
         self.samples: List[Dict[str, object]] = []
 
         skipped_due_to_contexts = 0
-        for example in tqdm(qa_split, desc="Preparing RAG QA split"):
+        for example in qa_split:
             question = example.get("question") or example.get("query") or ""
             if not question:
                 continue
