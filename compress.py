@@ -314,6 +314,10 @@ def main() -> None:
     args = parse_args()
 
     docs = load_and_flatten(args.dataset, limit=args.limit)
+    docs = {
+        doc_id: {k: v for k, v in payload.items() if k in ("query_id", "text")}
+        for doc_id, payload in docs.items()
+    }
     docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
     print(
         "Extracted {count} MS MARCO passages -> {path} "
