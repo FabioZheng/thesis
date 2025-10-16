@@ -222,7 +222,10 @@ def prepare_inputs(
     )
     token_ids = enc_tokens.get("input_ids", [])
     truncated_len = min(len(token_ids), max_length)
-    enc_max_len = max(truncated_len, 1)
+    if truncated_len == 0:
+        enc_max_len = max(rate, 1)
+    else:
+        enc_max_len = max(math.ceil(truncated_len / rate) * rate, rate)
 
     batch = {"text": [text]}
     inputs = prepare_auto_encoding(
