@@ -805,6 +805,10 @@ def main():
             "--embeddings_out",
             embeddings_dir,
         ]
+        if args.dataset_config_name:
+            compress_cmd.extend(["--dataset-config-name", args.dataset_config_name])
+        if args.dataset_split:
+            compress_cmd.extend(["--dataset-split", args.dataset_split])
         if args.checkpoint_path:
             compress_cmd.extend(["--checkpoint", args.checkpoint_path])
         elif args.model_name_or_path:

@@ -51,6 +51,18 @@ def get_fine_tuning_args():
     parser.add_argument("--experiment_folder", type=str, default="experiments_compress_real")
     parser.add_argument("--dataset_name_or_dir", type=str, default="openwebtext")
     parser.add_argument(
+        "--dataset_config_name",
+        type=str,
+        default=None,
+        help="Optional Hugging Face dataset configuration name (e.g. 'v1.1').",
+    )
+    parser.add_argument(
+        "--dataset_split",
+        type=str,
+        default=None,
+        help="Optional dataset split to load when using Hugging Face datasets (e.g. 'train').",
+    )
+    parser.add_argument(
         "--compression_linear_type",
         type=str,
         default=None,

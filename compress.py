@@ -19,7 +19,23 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate compressed contexts and embeddings for MS MARCO passages"
     )
-    parser.add_argument("--dataset", help="Path to MS MARCO dataset file (JSON/JSONL)", default="ms_marco_train.json")
+    parser.add_argument(
+        "--dataset",
+        help="Path to MS MARCO dataset file (JSON/JSONL) or Hugging Face dataset identifier",
+        default="ms_marco_train.json",
+    )
+    parser.add_argument(
+        "--dataset-config-name",
+        dest="dataset_config_name",
+        default=None,
+        help="Optional Hugging Face dataset configuration name (e.g. 'v1.1').",
+    )
+    parser.add_argument(
+        "--dataset-split",
+        dest="dataset_split",
+        default=None,
+        help="Optional dataset split to load from Hugging Face datasets (e.g. 'train').",
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
@@ -326,7 +342,12 @@ def main() -> None:
             raise ValueError("--limit must be non-negative")
         load_limit = args.limit + offset
 
-    docs = load_and_flatten(args.dataset, limit=load_limit)
+    docs = load_and_flatten(
+        args.dataset,
+        split=args.dataset_split,
+        name=args.dataset_config_name,
+        limit=load_limit,
+    )
 
     if offset or args.limit is not None:
         end_index: Optional[int] = None if args.limit is None else offset + args.limit
@@ -360,6 +381,8 @@ def main() -> None:
         args.docs_out,
         "queries.json",
         query_ids=query_ids or None,
+        split=args.dataset_split,
+        name=args.dataset_config_name,
     )
     print(
         "Extracted {count} queries -> {path} "
@@ -377,6 +400,8 @@ def main() -> None:
         args.docs_out,
         "answers.json",
         query_ids=query_ids or None,
+        split=args.dataset_split,
+        name=args.dataset_config_name,
     )
     print(
         "Extracted {count} answers -> {path} "
