@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
         help="Hugging Face model id to load instead of a local checkpoint",
     )
     parser.add_argument("--limit", type=int, help="Max number of rows", default=None)
+    parser.add_argument(
+        "--offset",
+        type=int,
+        help="Number of initial rows to skip before processing",
+        default=0,
+    )
     parser.add_argument("--compression_rate", type=int, help="Fallback rate", default=4)
     parser.add_argument("--docs_out", help="Directory to save flattened documents", default="data")
     parser.add_argument("--contexts_out", help="Directory to save compressed contexts", default="data/contexts")
@@ -313,7 +319,25 @@ def save_embeddings_npz(
 def main() -> None:
     args = parse_args()
 
-    docs = load_and_flatten(args.dataset, limit=args.limit)
+    offset = max(int(args.offset or 0), 0)
+    load_limit: Optional[int] = None
+    if args.limit is not None:
+        if args.limit < 0:
+            raise ValueError("--limit must be non-negative")
+        load_limit = args.limit + offset
+
+    docs = load_and_flatten(args.dataset, limit=load_limit)
+
+    if offset or args.limit is not None:
+        end_index: Optional[int] = None if args.limit is None else offset + args.limit
+        selected_payloads: List[Dict[str, Any]] = []
+        for doc_id in sorted(docs.keys()):
+            if doc_id < offset:
+                continue
+            if end_index is not None and doc_id >= end_index:
+                break
+            selected_payloads.append(docs[doc_id])
+        docs = {idx: payload for idx, payload in enumerate(selected_payloads)}
     docs_path, docs_mem = save_json(docs, args.docs_out, "docs.json")
     print(
         "Extracted {count} MS MARCO passages -> {path} "

@@ -3,9 +3,13 @@ import math
 import os
 import random
 import shutil
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
+
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -662,6 +666,27 @@ def main():
     final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
     save_log_path = os.path.join(args.experiment_folder, "save_log.jsonl")
 
+    docs_file_path = os.path.abspath(args.rag_docs_path)
+    contexts_file_path = os.path.abspath(args.rag_contexts_path)
+    embeddings_file_path = os.path.abspath(args.rag_embeddings_path)
+    queries_file_path = os.path.abspath(args.rag_queries_path)
+    answers_file_path = os.path.abspath(args.rag_answers_path)
+
+    docs_dir = os.path.dirname(docs_file_path)
+    contexts_dir = os.path.dirname(contexts_file_path)
+    embeddings_dir = os.path.dirname(embeddings_file_path)
+
+    cleanup_target = Path(docs_dir or ".").resolve()
+    cwd = Path.cwd().resolve()
+    should_cleanup_data = (
+        bool(docs_dir)
+        and cleanup_target != cwd
+        and cleanup_target != Path(cleanup_target.anchor)
+        and str(cleanup_target).startswith(str(cwd))
+    )
+
+    chunk_size = 10000
+
     if accelerator.is_main_process:
         run_name = (
             f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
@@ -684,37 +709,6 @@ def main():
 
     if not os.path.exists(model_output_dir):
         os.makedirs(model_output_dir, exist_ok=True)
-
-    context_store = load_context_store(args.rag_contexts_path)
-    retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
-    query_embedder = TextEmbedder(
-        model_name=args.retriever_model_name,
-        batch_size=args.retriever_batch_size,
-        device=args.retriever_device,
-        normalize=True,
-    )
-
-    train_examples, eval_examples = load_local_qa_splits(
-        queries_path=args.rag_queries_path,
-        answers_path=args.rag_answers_path,
-    )
-
-    train_dataset = RAGFineTuneDataset(
-        train_examples,
-        retriever,
-        query_embedder,
-        context_store,
-        top_k=args.retriever_top_k,
-    )
-    eval_dataset = RAGFineTuneDataset(
-        eval_examples,
-        retriever,
-        query_embedder,
-        context_store,
-        top_k=args.retriever_top_k,
-    )
-
-    del query_embedder
 
     if args.checkpoint_path:
         model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
@@ -757,35 +751,10 @@ def main():
         num_train_epochs=epochs,
     )
 
-    accelerator = Accelerator()
-
     world_size = max(accelerator.num_processes, 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
-    steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
-    total_steps = steps_per_epoch * epochs
 
-    trainer = FineTuningTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset,
-        eval_dataset=eval_dataset,
-        data_collator=data_collator,
-        compute_metrics=lambda e: compute_metrics(e, model=model),
-    )
-
-    trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)
-
-    model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
-        model,
-        trainer.optimizer,
-        trainer.get_train_dataloader(),
-        trainer.get_eval_dataloader(),
-    )
-
-    trainer.model = model
-    trainer.optimizer = optimizer
-    trainer._train_dataloader = train_dataloader
-    trainer._eval_dataloader = eval_dataloader
+    trainer: Optional[FineTuningTrainer] = None
 
     checkpoint = None
     last_checkpoint = None
@@ -805,24 +774,185 @@ def main():
         with open(config_path, "w") as json_file:
             json.dump(vars(args), json_file, indent=4)
 
-    trainer.add_callback(
-        PeriodicModelSaver(
-            accelerator=accelerator,
-            save_interval=args.save_every_steps,
-            target_dir=final_model_dir,
-            log_path=save_log_path,
-            config_path=config_path,
-        )
-    )
+    chunk_index = 0
+    processed_any_chunk = False
+    resume_argument: Optional[object] = checkpoint
 
-    trainer.train(resume_from_checkpoint=checkpoint)
+    while True:
+        offset = chunk_index * chunk_size
+
+        if should_cleanup_data and accelerator.is_main_process and cleanup_target.exists():
+            shutil.rmtree(cleanup_target)
+        accelerator.wait_for_everyone()
+
+        compress_cmd = [
+            sys.executable,
+            "compress.py",
+            "--limit",
+            str(chunk_size),
+            "--offset",
+            str(offset),
+            "--dataset",
+            args.dataset_name_or_dir,
+            "--docs_out",
+            docs_dir,
+            "--contexts_out",
+            contexts_dir,
+            "--embeddings_out",
+            embeddings_dir,
+        ]
+        if args.checkpoint_path:
+            compress_cmd.extend(["--checkpoint", args.checkpoint_path])
+        elif args.model_name_or_path:
+            compress_cmd.extend(["--hf_model_name", args.model_name_or_path])
+
+        if accelerator.is_main_process:
+            print(f"Preparing chunk {chunk_index} with offset {offset} using compress.py")
+            result = subprocess.run(compress_cmd, check=False)
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"compress.py failed with exit code {result.returncode} while processing chunk {chunk_index}."
+                )
+        accelerator.wait_for_everyone()
+
+        if not os.path.exists(docs_file_path):
+            if accelerator.is_main_process:
+                print("No documents generated for the current chunk; stopping.")
+            break
+
+        with open(docs_file_path, "r", encoding="utf-8") as handle:
+            docs_payload = json.load(handle)
+        doc_count = len(docs_payload)
+        del docs_payload
+
+        if doc_count == 0:
+            if accelerator.is_main_process:
+                print("Encountered empty document chunk; stopping further training.")
+            break
+
+        if not (os.path.exists(contexts_file_path) and os.path.exists(embeddings_file_path)):
+            raise FileNotFoundError("Expected compressed contexts and embeddings were not generated.")
+
+        context_store = load_context_store(contexts_file_path)
+        retriever = load_retriever(embeddings_file_path, docs_file_path)
+        query_embedder = TextEmbedder(
+            model_name=args.retriever_model_name,
+            batch_size=args.retriever_batch_size,
+            device=args.retriever_device,
+            normalize=True,
+        )
+
+        train_examples, eval_examples = load_local_qa_splits(
+            queries_path=queries_file_path,
+            answers_path=answers_file_path,
+        )
+
+        train_dataset = RAGFineTuneDataset(
+            train_examples,
+            retriever,
+            query_embedder,
+            context_store,
+            top_k=args.retriever_top_k,
+        )
+        eval_dataset = RAGFineTuneDataset(
+            eval_examples,
+            retriever,
+            query_embedder,
+            context_store,
+            top_k=args.retriever_top_k,
+        )
+
+        del query_embedder
+        del retriever
+
+        steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
+        chunk_steps = steps_per_epoch * epochs
+
+        if trainer is None:
+            trainer = FineTuningTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=train_dataset,
+                eval_dataset=eval_dataset,
+                data_collator=data_collator,
+                compute_metrics=lambda e: compute_metrics(e, model=model),
+            )
+            trainer.create_optimizer_and_scheduler(num_training_steps=chunk_steps)
+            model, optimizer, train_dataloader, eval_dataloader = accelerator.prepare(
+                model,
+                trainer.optimizer,
+                trainer.get_train_dataloader(),
+                trainer.get_eval_dataloader(),
+            )
+            trainer.model = model
+            trainer.optimizer = optimizer
+            trainer._train_dataloader = train_dataloader
+            trainer._eval_dataloader = eval_dataloader
+            trainer.args.num_train_epochs = epochs
+            trainer.state.max_steps = chunk_steps
+            trainer.args.max_steps = chunk_steps
+            trainer.add_callback(
+                PeriodicModelSaver(
+                    accelerator=accelerator,
+                    save_interval=args.save_every_steps,
+                    target_dir=final_model_dir,
+                    log_path=save_log_path,
+                    config_path=config_path,
+                )
+            )
+        else:
+            trainer.train_dataset = train_dataset
+            trainer.eval_dataset = eval_dataset
+            trainer.args.num_train_epochs = trainer.state.epoch + epochs
+            trainer.state.max_steps += chunk_steps
+            trainer.args.max_steps = trainer.state.max_steps
+            if hasattr(trainer.lr_scheduler, "total_steps"):
+                trainer.lr_scheduler.total_steps += chunk_steps
+            elif hasattr(trainer.lr_scheduler, "_total_steps"):
+                trainer.lr_scheduler._total_steps += chunk_steps
+            trainer._train_dataloader = None
+            trainer._eval_dataloader = None
+            train_dataloader = trainer.get_train_dataloader()
+            eval_dataloader = trainer.get_eval_dataloader()
+            train_dataloader, eval_dataloader = accelerator.prepare(
+                train_dataloader,
+                eval_dataloader,
+            )
+            trainer._train_dataloader = train_dataloader
+            trainer._eval_dataloader = eval_dataloader
+
+        current_resume = resume_argument if chunk_index == 0 else True
+        trainer.train(resume_from_checkpoint=current_resume)
+        trainer.save_state()
+        accelerator.wait_for_everyone()
+
+        processed_any_chunk = True
+        chunk_index += 1
+        resume_argument = True
+
+        if accelerator.is_main_process:
+            print(
+                f"Completed chunk {chunk_index} containing {doc_count} documents."
+            )
+
+        if doc_count < chunk_size:
+            if accelerator.is_main_process:
+                print("Last chunk processed contained fewer documents than the limit; stopping.")
+            break
+
+    if not processed_any_chunk:
+        raise RuntimeError("No data chunks were processed during fine-tuning.")
+
+    if should_cleanup_data and accelerator.is_main_process and cleanup_target.exists():
+        shutil.rmtree(cleanup_target)
+    accelerator.wait_for_everyone()
 
     overwrite_and_log_model(
         accelerator=accelerator,
         model=model,
         target_dir=final_model_dir,
         log_path=save_log_path,
-        step=trainer.state.global_step,
+        step=trainer.state.global_step if trainer is not None else 0,
         event_type="final",
         config_path=config_path,
     )
@@ -831,6 +961,7 @@ def main():
         print(f"Saved fine-tuned model to: {final_model_dir}")
         if os.path.exists(tmp_output_dir):
             shutil.rmtree(tmp_output_dir)
+
 
 
 if __name__ == "__main__":
