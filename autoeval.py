@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import pickle
+from collections import Counter
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -25,7 +27,9 @@ import evaluate
 from datasets import load_dataset as hf_load_dataset
 
 from modeling_cocom import COCOM
+from cmab_agent import CompressionBanditAgent
 from utils import prepare_auto_encoding
+from metrics import batch_entropy
 
 
 DEFAULT_DATASET_NAME = "wshuai190/kilt-128"
@@ -46,6 +50,7 @@ class EvaluationConfig:
     save_dir: Path
     device: torch.device
     plot_bertscore: bool
+    bandit_path: Optional[str]
 
 
 @dataclass
@@ -89,6 +94,12 @@ def parse_args() -> EvaluationConfig:
         action="store_true",
         help="If set, also plot BERTScore on the RD curve",
     )
+    parser.add_argument(
+        "--bandit_path",
+        type=str,
+        default="bandit_ckpt/bandit_agent.pkl",
+        help="Path to the trained bandit agent",
+    )
 
     args = parser.parse_args()
 
@@ -104,6 +115,7 @@ def parse_args() -> EvaluationConfig:
         save_dir=args.save_dir,
         device=device,
         plot_bertscore=args.plot_bertscore,
+        bandit_path=args.bandit_path,
     )
 
 
@@ -169,12 +181,27 @@ def download_model_snapshot(model_id: str) -> Path:
     return Path(cache_dir)
 
 
-def load_cocom_model(model_id: str, device: torch.device) -> COCOM:
+def load_cocom_model(model_id: str, device: torch.device, bandit_path: Optional[str] = None) -> COCOM:
     model_path = download_model_snapshot(model_id)
     dtype = torch.bfloat16 if device.type != "cpu" else torch.float32
     model = COCOM.from_pretrained(model_path, torch_dtype=dtype, local_files_only=True)
     model.to(device)
     model.eval()
+
+    if bandit_path:
+        print(f"Loading bandit agent from {bandit_path}")
+        with open(bandit_path, "rb") as f:
+            bandit_data = pickle.load(f)
+        agent = CompressionBanditAgent(
+            rates=bandit_data["rates"],
+            alpha=bandit_data["alpha"],
+            use_length_feature=bandit_data.get("use_length_feature", False),
+        )
+        agent.A = bandit_data["A"]
+        agent.b = bandit_data["b"]
+        model.set_bandit_agent(agent)
+        print("Bandit agent loaded and attached to the model.")
+
     return model
 
 
@@ -213,9 +240,20 @@ def autoencode_example(
     rate: int,
     device: torch.device,
     max_new_tokens: int = 512,
+    agent: Optional[CompressionBanditAgent] = None,
 ) -> Tuple[str, int, float, float]:
     compressor_tokenizer = model.compr.tokenizer if getattr(model, "compr", None) is not None else model.decoder_tokenizer
     max_length = determine_default_max_length(compressor_tokenizer)
+
+    if agent:
+        # Calculate context for bandit
+        enc_tokens = compressor_tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        input_ids = enc_tokens["input_ids"]
+        attention_mask = enc_tokens["attention_mask"]
+        entropy = batch_entropy(input_ids, attention_mask)[0]
+        length = attention_mask.sum().item()
+        rate = agent.select_rate(entropy, length)
+
     inputs = prepare_inputs(model, text, rate, max_length)
 
     enc_input_ids = inputs["enc_input_ids"].to(device)
@@ -283,6 +321,7 @@ def evaluate_model(
     device: torch.device,
     token_counter: Any,
     save_dir: Path,
+    agent: Optional[CompressionBanditAgent] = None,
 ) -> List[ExampleResult]:
     ensure_dir(save_dir)
     log_path = save_dir / f"{name}.jsonl"
@@ -306,10 +345,13 @@ def evaluate_model(
             if default_rate is not None:
                 rate = default_rate
             else:
+                # For the adaptive model, the rate is determined per example
                 rate = int(getattr(model, "current_rate", 4))
 
             try:
-                decoded, tokens_out, encode_time, decode_time = autoencode_example(model, text, rate, device)
+                decoded, tokens_out, encode_time, decode_time = autoencode_example(
+                    model, text, rate, device, agent=agent
+                )
             except Exception as exc:  # pragma: no cover - best effort logging
                 error_record = {
                     "id": doc_id,
@@ -478,7 +520,9 @@ def main() -> None:
     all_results: Dict[str, List[ExampleResult]] = {}
     summaries: Dict[str, Dict[str, Dict[str, float]]] = {}
 
-    adaptive_model = load_cocom_model(ADAPTIVE_MODEL_ID, config.device)
+    adaptive_model = load_cocom_model(
+        ADAPTIVE_MODEL_ID, config.device, bandit_path=config.bandit_path
+    )
     token_counter = adaptive_model.decoder_tokenizer
 
     adaptive_results = evaluate_model(
@@ -489,6 +533,7 @@ def main() -> None:
         device=config.device,
         token_counter=token_counter,
         save_dir=config.save_dir,
+        agent=getattr(adaptive_model, "bandit_agent", None),
     )
     all_results["adaptive"] = adaptive_results
     summaries["adaptive"] = summarize_results(adaptive_results)
