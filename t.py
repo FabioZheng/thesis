@@ -24,7 +24,7 @@ def _resolve_context_path(path_str: str) -> Path:
     raise FileNotFoundError(f"Could not find context file at {path} or known alternatives.")
 
 
-def _load_first_context(path: Path) -> Tuple[str, torch.Tensor, Dict[str, Any]]:
+def _load_first_context(path: Path) -> Tuple[str, torch.Tensor, int, int, Dict[str, Any]]:
     data = torch.load(path, map_location="cpu")
     if not isinstance(data, dict) or not data:
         raise ValueError("Context file must contain a non-empty dictionary of tensors.")
@@ -46,15 +46,28 @@ def _load_first_context(path: Path) -> Tuple[str, torch.Tensor, Dict[str, Any]]:
         context = torch.as_tensor(context)
 
     # Stored contexts can have a batch dimension of size 1; remove it for convenience.
+    if context.dim() == 4 and context.size(0) == 1:
+        context = context.squeeze(0)
+
     if context.dim() == 3 and context.size(0) == 1:
         context = context.squeeze(0)
 
-    if context.dim() != 2:
+    if context.dim() == 2:
+        top_k = 1
+        mem_tokens = context.size(0)
+        context = context.unsqueeze(0)
+    elif context.dim() == 3:
+        top_k = context.size(0)
+        mem_tokens = context.size(1)
+    else:
         raise ValueError(
-            "Context tensor must have shape (mem_tokens, hidden_size) after squeezing the batch dimension."
+            "Context tensor must have shape (mem_tokens, hidden) or (top_k, mem_tokens, hidden)."
         )
 
-    return str(first_key), context.to(torch.float32), metadata
+    metadata.setdefault("top_k", top_k)
+    metadata.setdefault("mem_tokens", mem_tokens)
+
+    return str(first_key), context.to(torch.float32), top_k, mem_tokens, metadata
 
 
 def _build_autoencoding_prompt(tokenizer, mem_tokens: int) -> Dict[str, torch.Tensor]:
@@ -70,7 +83,7 @@ def _build_autoencoding_prompt(tokenizer, mem_tokens: int) -> Dict[str, torch.Te
     encoded = tokenizer(
         prompt,
         return_tensors="pt",
-        padding=False,
+        padding="longest",
         truncation=False,
         add_special_tokens=False,
     )
@@ -82,25 +95,32 @@ def decode_first_context(
     model_source: str,
     max_new_tokens: int,
 ) -> None:
-    doc_id, context, metadata = _load_first_context(context_path)
-    print(f"Loaded context for document id {doc_id} (metadata: {metadata}).")
+    doc_id, context, top_k, mem_tokens, metadata = _load_first_context(context_path)
+    print(
+        "Loaded context for document id"
+        f" {doc_id} (mem_tokens={mem_tokens}, top_k={top_k}, metadata: {metadata})."
+    )
 
     model = load_model_safely(model_source)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     model.eval()
 
-    mem_tokens = context.size(0)
     prompt = _build_autoencoding_prompt(model.decoder_tokenizer, mem_tokens)
 
     dec_input_ids = prompt["input_ids"].to(device)
     dec_attention_mask = prompt["attention_mask"].to(device)
 
     context = context.to(model.decoder.get_input_embeddings().weight.dtype)
-    context = context.unsqueeze(0).unsqueeze(0)  # (batch=1, top_k=1, mem_tokens, hidden)
+    if context.dim() == 3:
+        context = context.unsqueeze(0)
+
+    if context.size(0) != 1:
+        raise ValueError(
+            "Decoded contexts must represent a single document."
+        )
 
     with torch.no_grad():
-        top_k = context.size(1)
         model.generation_top_k = top_k
         flattened = context.reshape(context.size(0) * top_k, context.size(2), context.size(3)).to(device)
         indices = range(0, flattened.size(0) + 1, top_k)
@@ -108,15 +128,25 @@ def decode_first_context(
         outputs = model.decoder.generate(
             inputs_embeds=inputs_embeds,
             attention_mask=dec_attention_mask,
+            decoder_input_ids=dec_input_ids,
             do_sample=False,
             top_p=None,
             max_new_tokens=max_new_tokens,
+            pad_token_id=model.decoder_tokenizer.pad_token_id,
+            eos_token_id=model.decoder_tokenizer.eos_token_id,
         )
         decoded = model.decoder_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        decoded_with_specials = model.decoder_tokenizer.batch_decode(
+            outputs, skip_special_tokens=False
+        )
 
     text = decoded[0] if decoded else ""
-    print("Decoded text:\n")
+    print("Decoded text (special tokens removed):\n")
     print(text)
+
+    if decoded_with_specials:
+        print("\nDecoded text (raw tokens):\n")
+        print(decoded_with_specials[0])
 
 
 def main() -> None:
