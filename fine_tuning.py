@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -91,6 +92,101 @@ def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> FaissRetri
     doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(index_to_doc_id)}
 
     return FaissRetriever(index=index, index_to_doc_id=index_to_doc_id, doc_id_to_index=doc_id_to_index)
+
+
+def _extract_doc_text(payload: object) -> Optional[str]:
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        text = payload.strip()
+        return text or None
+    if isinstance(payload, dict):
+        for key in ("text", "contents", "content", "body", "document", "passage"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def load_docs_lookup(docs_path: Optional[str]) -> Dict[str, str]:
+    if not docs_path or not os.path.exists(docs_path):
+        return {}
+
+    with open(docs_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    lookup: Dict[str, str] = {}
+    if isinstance(payload, dict):
+        for doc_id, value in payload.items():
+            text = _extract_doc_text(value)
+            if text:
+                lookup[_to_str_doc_id(doc_id)] = text
+    elif isinstance(payload, list):
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            doc_id = entry.get("doc_id") or entry.get("id") or entry.get("document_id")
+            if doc_id is None:
+                continue
+            text = _extract_doc_text(entry)
+            if text:
+                lookup[_to_str_doc_id(doc_id)] = text
+    return lookup
+
+
+def _format_doc_preview(text: str, max_lines: int = 3, max_chars: int = 200) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    selected = lines[:max_lines]
+    preview = "\n".join(selected)
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 3].rstrip() + "..."
+    return preview
+
+
+def preview_retrieval(
+    split_name: str,
+    examples: List[Dict[str, object]],
+    retriever: FaissRetriever,
+    query_embedder: TextEmbedder,
+    docs_lookup: Dict[str, str],
+    top_k: int,
+) -> None:
+    if not examples:
+        print(f"No examples available in the {split_name} split for retrieval preview.")
+        return
+
+    sample = random.choice(examples)
+    question = sample.get("question") or sample.get("query") or ""
+    if not question:
+        print(f"Selected example from {split_name} split does not contain a question.")
+        return
+
+    retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
+
+    print("\n=== Retrieval preview ({split}) ===".format(split=split_name))
+    print(f"Query: {question}")
+    if not retrieved_doc_ids:
+        print("No documents retrieved for the preview query.")
+        return
+
+    for rank, doc_id in enumerate(retrieved_doc_ids, start=1):
+        doc_key = _to_str_doc_id(doc_id)
+        print(f"{rank}. doc_id={doc_key}")
+        doc_text = docs_lookup.get(doc_key)
+        if not doc_text:
+            print("   [document text unavailable]")
+            continue
+        preview = _format_doc_preview(doc_text)
+        if preview:
+            indented = textwrap.indent(preview, prefix="   ")
+            print(indented)
+        else:
+            print("   [document text unavailable]")
 
 
 def _flatten_answer_texts(payload: object) -> List[str]:
@@ -712,6 +808,25 @@ def main():
         queries_path=args.rag_queries_path,
         answers_path=args.rag_answers_path,
     )
+
+    docs_lookup = load_docs_lookup(args.rag_docs_path)
+
+    if args.retrieval_preview_split:
+        split_key = args.retrieval_preview_split.lower()
+        if split_key == "train":
+            preview_examples = train_examples
+        elif split_key == "eval":
+            preview_examples = eval_examples
+        else:
+            preview_examples = []
+        preview_retrieval(
+            split_key,
+            preview_examples,
+            retriever,
+            query_embedder,
+            docs_lookup,
+            top_k=args.retriever_top_k,
+        )
 
     train_dataset = RAGFineTuneDataset(
         train_examples,

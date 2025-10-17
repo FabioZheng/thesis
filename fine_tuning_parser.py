@@ -79,4 +79,16 @@ def get_fine_tuning_args():
     )
     parser.add_argument("--retriever_top_k", type=int, default=5)
     parser.add_argument("--decoder_max_length", type=int, default=256)
+    parser.add_argument(
+        "--retrieval_preview_split",
+        type=str,
+        choices=["train", "eval"],
+        default=None,
+        help=(
+            "Optional split to preview FAISS retrieval results. When provided, the script "
+            "prints a sample query alongside the retrieved document ids and a snippet of "
+            "each document."
+        ),
+    )
     return parser.parse_args()
+
