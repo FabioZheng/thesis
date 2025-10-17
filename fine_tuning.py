@@ -16,7 +16,6 @@ from accelerate import Accelerator
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments, TrainerCallback
-from analyse.retrieval import TextEmbedder
 from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
 from metrics import exact_match_score, f1_score
@@ -69,12 +68,19 @@ class FaissRetriever:
     index_to_doc_id: List[str]
     doc_id_to_index: Dict[str, int]
 
-    def search(self, query: str, query_embedder: TextEmbedder, k: int = 5) -> List[str]:
-        query_embedding = query_embedder.encode([query])[0].astype(np.float32)
-        norm = float(np.linalg.norm(query_embedding))
-        if norm > 0:
-            query_embedding /= norm
-        _scores, indices = self.index.search(query_embedding[None, :], k)
+    def search(self, query_embedding: np.ndarray, k: int = 5) -> List[str]:
+        vector = np.asarray(query_embedding, dtype=np.float32)
+        if vector.ndim == 1:
+            vector = vector.reshape(1, -1).copy()
+        elif vector.ndim == 2:
+            if vector.shape[0] != 1:
+                vector = vector.reshape(1, -1).copy()
+            else:
+                vector = vector.copy()
+        else:
+            vector = vector.reshape(1, -1).copy()
+        faiss.normalize_L2(vector)
+        _scores, indices = self.index.search(vector, k)
         doc_ids: List[str] = []
         if indices.size:
             for idx in indices[0]:
@@ -102,6 +108,32 @@ def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> FaissRetri
     doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(index_to_doc_id)}
 
     return FaissRetriever(index=index, index_to_doc_id=index_to_doc_id, doc_id_to_index=doc_id_to_index)
+
+
+def load_query_embedding_store(
+    embeddings_path: str,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, str]]:
+    if not os.path.exists(embeddings_path):
+        raise FileNotFoundError(f"Query embeddings not found at {embeddings_path}")
+
+    with np.load(embeddings_path) as embeddings_file:
+        query_ids_raw = embeddings_file["query_ids"]
+        query_texts_raw = embeddings_file["query_texts"]
+        embeddings = np.asarray(embeddings_file["embeddings"], dtype=np.float32)
+
+    if len(query_ids_raw) != len(embeddings) or len(query_texts_raw) != len(embeddings):
+        raise ValueError("Mismatch between query ids, texts, and embeddings in query store.")
+
+    faiss.normalize_L2(embeddings)
+
+    query_vectors: Dict[str, np.ndarray] = {}
+    query_text_lookup: Dict[str, str] = {}
+    for idx, raw_id in enumerate(query_ids_raw):
+        query_id = _to_str_doc_id(raw_id)
+        query_vectors[query_id] = embeddings[idx]
+        query_text_lookup[query_id] = str(query_texts_raw[idx])
+
+    return query_vectors, query_text_lookup
 
 
 def _extract_doc_text(payload: object) -> Optional[str]:
@@ -162,7 +194,7 @@ def preview_retrieval(
     split_name: str,
     examples: List[Dict[str, object]],
     retriever: FaissRetriever,
-    query_embedder: TextEmbedder,
+    query_vectors: Dict[str, np.ndarray],
     docs_lookup: Dict[str, str],
     top_k: int,
 ) -> None:
@@ -176,7 +208,19 @@ def preview_retrieval(
         print(f"Selected example from {split_name} split does not contain a question.")
         return
 
-    retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
+    query_id = sample.get("query_id")
+    if query_id is None:
+        print(f"Selected example from {split_name} split is missing a query id.")
+        return
+
+    lookup_key = _to_str_doc_id(query_id)
+    if lookup_key not in query_vectors:
+        print(
+            f"Query id {lookup_key} does not have a precomputed embedding; unable to preview retrieval."
+        )
+        return
+
+    retrieved_doc_ids = retriever.search(query_vectors[lookup_key], k=top_k)
 
     print("\n=== Retrieval preview ({split}) ===".format(split=split_name))
     print(f"Query: {question}")
@@ -354,7 +398,7 @@ def _build_split_examples(
         if answers_dict is None:
             continue
 
-        examples.append({"question": question, "answers": answers_dict})
+        examples.append({"query_id": query_id, "question": question, "answers": answers_dict})
     return examples
 
 
@@ -426,7 +470,8 @@ class RAGFineTuneDataset(Dataset):
         self,
         qa_split: Iterable[Dict],
         retriever: FaissRetriever,
-        query_embedder: TextEmbedder,
+        query_vectors: Dict[str, np.ndarray],
+        query_text_lookup: Dict[str, str],
         context_store_path: str,
         doc_id_to_index: Dict[str, int],
         top_k: int,
@@ -440,12 +485,32 @@ class RAGFineTuneDataset(Dataset):
         self.samples: List[Dict[str, object]] = []
 
         skipped_due_to_contexts = 0
+        skipped_due_to_embeddings = 0
+        mismatched_query_ids: set[str] = set()
         for example in tqdm(qa_split, desc="Preparing RAG QA split"):
             question = example.get("question") or example.get("query") or ""
             if not question:
                 continue
             answer = _extract_answer(example)
-            retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
+            query_id_raw = example.get("query_id")
+            if query_id_raw is None:
+                skipped_due_to_embeddings += 1
+                continue
+            query_id = _to_str_doc_id(query_id_raw)
+            vector = query_vectors.get(query_id)
+            if vector is None:
+                skipped_due_to_embeddings += 1
+                continue
+
+            stored_text = query_text_lookup.get(query_id)
+            if stored_text and stored_text.strip() and question.strip():
+                if stored_text.strip() != question.strip() and query_id not in mismatched_query_ids:
+                    tqdm.write(
+                        f"Warning: Question text for query id {query_id} does not match stored query text."
+                    )
+                    mismatched_query_ids.add(query_id)
+
+            retrieved_doc_ids = retriever.search(vector, k=top_k)
             doc_ids: List[str] = []
             for doc_id in retrieved_doc_ids:
                 key = _to_str_doc_id(doc_id)
@@ -455,6 +520,7 @@ class RAGFineTuneDataset(Dataset):
                 skipped_due_to_contexts += 1
                 continue
             self.samples.append({
+                "query_id": query_id,
                 "question": question,
                 "answer": answer,
                 "doc_ids": doc_ids[:top_k],
@@ -464,7 +530,11 @@ class RAGFineTuneDataset(Dataset):
         if retained == 0:
             raise ValueError("No training examples available after retrieval. Check retrieval resources.")
         print(
-            f"Prepared {retained} examples for RAG fine-tuning (skipped {skipped_due_to_contexts} without sufficient contexts)."
+            "Prepared {retained} examples for RAG fine-tuning (skipped {skipped_ctx} without sufficient contexts, {skipped_emb} without embeddings).".format(
+                retained=retained,
+                skipped_ctx=skipped_due_to_contexts,
+                skipped_emb=skipped_due_to_embeddings,
+            )
         )
 
     def __len__(self) -> int:
@@ -674,7 +744,7 @@ class RetrievalPreviewCallback(TrainerCallback):
         split_name: str,
         examples: List[Dict[str, object]],
         retriever: FaissRetriever,
-        query_embedder: TextEmbedder,
+        query_vectors: Dict[str, np.ndarray],
         docs_lookup: Dict[str, str],
         top_k: int,
     ) -> None:
@@ -682,20 +752,20 @@ class RetrievalPreviewCallback(TrainerCallback):
         self.split_name = split_name
         self.examples = examples
         self.retriever = retriever
-        self.query_embedder = query_embedder
+        self.query_vectors = query_vectors
         self.docs_lookup = docs_lookup
         self.top_k = top_k
 
     def on_evaluate(self, args, state, control, **kwargs):
         if not self.accelerator.is_main_process:
             return control
-        if not self.examples or self.query_embedder is None:
+        if not self.examples or not self.query_vectors:
             return control
         preview_retrieval(
             self.split_name,
             self.examples,
             self.retriever,
-            self.query_embedder,
+            self.query_vectors,
             self.docs_lookup,
             top_k=self.top_k,
         )
@@ -861,11 +931,14 @@ def main():
 
     context_index = load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
-    query_embedder = TextEmbedder(
-        model_name=args.retriever_model_name,
-        batch_size=args.retriever_batch_size,
-        device=args.retriever_device,
-        normalize=True,
+
+    query_embeddings_path = getattr(args, "rag_query_embeddings_path", None)
+    if not query_embeddings_path:
+        base_dir = os.path.dirname(args.rag_embeddings_path)
+        query_embeddings_path = os.path.join(base_dir, "query_embeddings.npz")
+    query_vectors, query_text_lookup = load_query_embedding_store(query_embeddings_path)
+    print(
+        f"Loaded {len(query_vectors)} query embeddings from {query_embeddings_path}"
     )
 
     train_examples, eval_examples = load_local_qa_splits(
@@ -875,12 +948,11 @@ def main():
 
     docs_lookup = load_docs_lookup(args.rag_docs_path)
 
-    preview_query_embedder = query_embedder if args.show_retrieval_preview else None
-
     train_dataset = RAGFineTuneDataset(
         train_examples,
         retriever,
-        query_embedder,
+        query_vectors,
+        query_text_lookup,
         args.rag_contexts_path,
         context_index,
         top_k=args.retriever_top_k,
@@ -888,14 +960,12 @@ def main():
     eval_dataset = RAGFineTuneDataset(
         eval_examples,
         retriever,
-        query_embedder,
+        query_vectors,
+        query_text_lookup,
         args.rag_contexts_path,
         context_index,
         top_k=args.retriever_top_k,
     )
-
-    if not args.show_retrieval_preview:
-        del query_embedder
 
     if args.checkpoint_path:
         model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
@@ -961,7 +1031,7 @@ def main():
                 split_name="eval",
                 examples=eval_examples,
                 retriever=retriever,
-                query_embedder=preview_query_embedder,
+                query_vectors=query_vectors,
                 docs_lookup=docs_lookup,
                 top_k=args.retriever_top_k,
             )
