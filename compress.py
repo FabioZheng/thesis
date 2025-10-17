@@ -288,7 +288,6 @@ def save_contexts(
     os.makedirs(directory, exist_ok=True)
 
     path = os.path.join(directory, filename)
-    index_path = os.path.join(directory, os.path.splitext(filename)[0] + "_index.json")
     metadata_path = os.path.join(directory, os.path.splitext(filename)[0] + "_metadata.json")
 
     doc_items = sorted(
@@ -350,18 +349,13 @@ def save_contexts(
         doc_id_dtype = h5py.string_dtype(encoding="utf-8")
         h5.create_dataset("doc_ids", (len(doc_ids),), dtype=doc_id_dtype, data=doc_ids)
 
-    with open(index_path, "w", encoding="utf-8") as index_handle:
-        json.dump(doc_ids, index_handle)
-
     with open(metadata_path, "w", encoding="utf-8") as metadata_handle:
         json.dump(metadata, metadata_handle, ensure_ascii=False)
 
     memory_stats: Dict[str, Any] = {
         "approx_memory_mb": approx_bytes / (1024 * 1024),
         "h5_disk_mb": os.path.getsize(path) / (1024 * 1024),
-        "index_disk_mb": os.path.getsize(index_path) / (1024 * 1024),
         "metadata_disk_mb": os.path.getsize(metadata_path) / (1024 * 1024),
-        "index_path": index_path,
         "metadata_path": metadata_path,
     }
     return path, memory_stats
@@ -579,19 +573,18 @@ def main() -> None:
     contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.h5")
     print(
         "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
-        "(approx memory: {mem:.2f} MB, h5: {h5:.2f} MB, index: {index:.2f} MB, metadata: {meta:.2f} MB)".format(
+        "(approx memory: {mem:.2f} MB, h5: {h5:.2f} MB, metadata: {meta:.2f} MB)".format(
             count=len(contexts),
             model_src=model_source,
             path=contexts_path,
             mem=ctx_mem.get("approx_memory_mb", 0.0),
             h5=ctx_mem.get("h5_disk_mb", 0.0),
-            index=ctx_mem.get("index_disk_mb", 0.0),
             meta=ctx_mem.get("metadata_disk_mb", 0.0),
         )
     )
     print(
-        "Context index mapping saved to {index_path}; metadata saved to {metadata_path}".format(
-            index_path=ctx_mem.get("index_path"), metadata_path=ctx_mem.get("metadata_path")
+        "Context metadata saved to {metadata_path}".format(
+            metadata_path=ctx_mem.get("metadata_path")
         )
     )
 
