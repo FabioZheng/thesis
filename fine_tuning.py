@@ -7,13 +7,14 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import faiss
 import numpy as np
 import torch
 from accelerate import Accelerator
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments, TrainerCallback
-from analyse.retrieval import CosineRetriever, TextEmbedder
+from analyse.retrieval import TextEmbedder
 from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
 from metrics import exact_match_score, f1_score
@@ -51,32 +52,45 @@ def load_context_store(path: str) -> Dict[str, torch.Tensor]:
     return context_store
 
 
-def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> CosineRetriever:
+@dataclass
+class FaissRetriever:
+    index: "faiss.Index"
+    index_to_doc_id: List[str]
+    doc_id_to_index: Dict[str, int]
+
+    def search(self, query: str, query_embedder: TextEmbedder, k: int = 5) -> List[str]:
+        query_embedding = query_embedder.encode([query])[0].astype(np.float32)
+        norm = float(np.linalg.norm(query_embedding))
+        if norm > 0:
+            query_embedding /= norm
+        _scores, indices = self.index.search(query_embedding[None, :], k)
+        doc_ids: List[str] = []
+        if indices.size:
+            for idx in indices[0]:
+                if idx < 0 or idx >= len(self.index_to_doc_id):
+                    continue
+                doc_ids.append(self.index_to_doc_id[idx])
+        return doc_ids
+
+
+def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> FaissRetriever:
     with np.load(embeddings_path) as embeddings_file:
         doc_ids = [_to_str_doc_id(doc_id) for doc_id in embeddings_file["doc_ids"]]
         embeddings = embeddings_file["embeddings"]
 
-    docs: Dict[str, Dict[str, str]] = {}
-    if docs_path and os.path.exists(docs_path):
-        with open(docs_path, "r", encoding="utf-8") as handle:
-            docs = json.load(handle)
+    if embeddings.shape[0] != len(doc_ids):
+        raise ValueError("Number of embeddings does not match number of document IDs.")
 
-    store: Dict[str, Dict[str, str]] = {}
-    for doc_id in doc_ids:
-        doc_payload = docs.get(doc_id)
-        if doc_payload is None:
-            try:
-                numeric_key = str(int(float(doc_id)))
-            except Exception:
-                numeric_key = None
-            if numeric_key is not None:
-                doc_payload = docs.get(numeric_key)
-        text = ""
-        if isinstance(doc_payload, dict):
-            text = doc_payload.get("text", "")
-        store[doc_id] = {"text": text}
+    embeddings = np.ascontiguousarray(embeddings.astype(np.float32))
+    faiss.normalize_L2(embeddings)
 
-    return CosineRetriever(embeddings=embeddings, doc_ids=doc_ids, store=store)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+
+    index_to_doc_id = list(doc_ids)
+    doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(index_to_doc_id)}
+
+    return FaissRetriever(index=index, index_to_doc_id=index_to_doc_id, doc_id_to_index=doc_id_to_index)
 
 
 def _flatten_answer_texts(payload: object) -> List[str]:
@@ -305,7 +319,7 @@ class RAGFineTuneDataset(Dataset):
     def __init__(
         self,
         qa_split: Iterable[Dict],
-        retriever: CosineRetriever,
+        retriever: FaissRetriever,
         query_embedder: TextEmbedder,
         context_store: Dict[str, torch.Tensor],
         top_k: int,
@@ -320,9 +334,9 @@ class RAGFineTuneDataset(Dataset):
             if not question:
                 continue
             answer = _extract_answer(example)
-            hits = retriever.search(question, query_embedder, k=top_k)
+            retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
             doc_ids: List[str] = []
-            for doc_id, _score, _text in hits:
+            for doc_id in retrieved_doc_ids:
                 key = _to_str_doc_id(doc_id)
                 if key in context_store:
                     doc_ids.append(key)
