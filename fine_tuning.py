@@ -39,40 +39,28 @@ def _to_str_doc_id(doc_id: object) -> str:
         return str(doc_id)
 
 
-def load_context_store(path: str) -> Dict[str, torch.Tensor]:
+def load_context_store(path: str) -> Dict[str, int]:
     if not os.path.exists(path):
         raise FileNotFoundError(f"Context store not found at {path}")
 
-    context_store: Dict[str, torch.Tensor] = {}
+    context_index: Dict[str, int] = {}
 
     with h5py.File(path, "r") as handle:
+        if "contexts" not in handle or "shapes" not in handle or "doc_ids" not in handle:
+            raise KeyError("Context store is missing required datasets: 'contexts', 'shapes', or 'doc_ids'.")
+
         contexts_ds = handle["contexts"]
         shapes_ds = handle["shapes"]
         doc_ids_raw = handle["doc_ids"]
 
-        doc_ids: List[str] = []
-        for raw_id in doc_ids_raw:
-            doc_ids.append(_to_str_doc_id(raw_id))
-
-        if len(contexts_ds) != len(doc_ids) or len(shapes_ds) != len(doc_ids):
+        if len(contexts_ds) != len(doc_ids_raw) or len(shapes_ds) != len(doc_ids_raw):
             raise ValueError("Mismatch between contexts, shapes, and doc id entries in context store")
 
-        for idx, doc_id in enumerate(doc_ids):
-            flattened = np.asarray(contexts_ds[idx], dtype=np.float32)
-            shape_arr = np.asarray(shapes_ds[idx], dtype=np.int64)
-            shape = tuple(int(dim) for dim in shape_arr.tolist())
-            if not shape:
-                raise ValueError(f"Missing shape information for context index {idx}")
+        for idx, raw_id in enumerate(doc_ids_raw):
+            doc_id = _to_str_doc_id(raw_id)
+            context_index[doc_id] = idx
 
-            context_array = flattened.reshape(shape)
-            context_tensor = torch.from_numpy(context_array)
-
-            if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
-                context_tensor = context_tensor.squeeze(0)
-
-            context_store[doc_id] = context_tensor.to(torch.float32)
-
-    return context_store
+    return context_index
 
 
 @dataclass
@@ -439,10 +427,15 @@ class RAGFineTuneDataset(Dataset):
         qa_split: Iterable[Dict],
         retriever: FaissRetriever,
         query_embedder: TextEmbedder,
-        context_store: Dict[str, torch.Tensor],
+        context_store_path: str,
+        doc_id_to_index: Dict[str, int],
         top_k: int,
     ) -> None:
-        self.context_store = context_store
+        if not os.path.exists(context_store_path):
+            raise FileNotFoundError(f"Context store not found at {context_store_path}")
+
+        self.context_store_path = context_store_path
+        self.doc_id_to_index = doc_id_to_index
         self.top_k = top_k
         self.samples: List[Dict[str, object]] = []
 
@@ -456,7 +449,7 @@ class RAGFineTuneDataset(Dataset):
             doc_ids: List[str] = []
             for doc_id in retrieved_doc_ids:
                 key = _to_str_doc_id(doc_id)
-                if key in context_store:
+                if key in self.doc_id_to_index:
                     doc_ids.append(key)
             if len(doc_ids) < top_k:
                 skipped_due_to_contexts += 1
@@ -484,13 +477,27 @@ class RAGFineTuneDataset(Dataset):
         doc_ids: Iterable[str] = sample["doc_ids"]
 
         context_tensors: List[torch.Tensor] = []
-        for doc_id in doc_ids:
-            context_tensor = self.context_store[doc_id]
-            tensor = context_tensor
-            if tensor.dim() == 3 and tensor.size(0) == 1:
-                tensor = tensor.squeeze(0)
-            tensor = tensor.to(dtype=torch.float32)
-            context_tensors.append(tensor)
+        with h5py.File(self.context_store_path, "r") as handle:
+            contexts_ds = handle["contexts"]
+            shapes_ds = handle["shapes"]
+
+            for doc_id in doc_ids:
+                if doc_id not in self.doc_id_to_index:
+                    raise KeyError(f"Document id {doc_id} not found in context store index")
+
+                context_idx = self.doc_id_to_index[doc_id]
+                flattened = np.asarray(contexts_ds[context_idx], dtype=np.float32)
+                shape_arr = np.asarray(shapes_ds[context_idx], dtype=np.int64)
+                shape = tuple(int(dim) for dim in shape_arr.tolist())
+                if not shape:
+                    raise ValueError(f"Missing shape information for context index {context_idx}")
+
+                context_array = flattened.reshape(shape)
+                context_tensor = torch.from_numpy(context_array)
+                if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
+                    context_tensor = context_tensor.squeeze(0)
+                tensor = context_tensor.to(dtype=torch.float32)
+                context_tensors.append(tensor)
 
         if not context_tensors:
             raise ValueError("Missing context tensors for retrieved document ids.")
@@ -852,7 +859,7 @@ def main():
     if not os.path.exists(model_output_dir):
         os.makedirs(model_output_dir, exist_ok=True)
 
-    context_store = load_context_store(args.rag_contexts_path)
+    context_index = load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
     query_embedder = TextEmbedder(
         model_name=args.retriever_model_name,
@@ -874,14 +881,16 @@ def main():
         train_examples,
         retriever,
         query_embedder,
-        context_store,
+        args.rag_contexts_path,
+        context_index,
         top_k=args.retriever_top_k,
     )
     eval_dataset = RAGFineTuneDataset(
         eval_examples,
         retriever,
         query_embedder,
-        context_store,
+        args.rag_contexts_path,
+        context_index,
         top_k=args.retriever_top_k,
     )
 
