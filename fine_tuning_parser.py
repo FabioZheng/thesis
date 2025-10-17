@@ -56,7 +56,7 @@ def get_fine_tuning_args():
         default=None,
         help="Optional override for the compression projection layout when not using the pretrained value.",
     )
-    parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.pt")
+    parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.h5")
     parser.add_argument("--rag_embeddings_path", type=str, default="data/embeddings/embeddings.npz")
     parser.add_argument("--rag_docs_path", type=str, default="data/docs.json")
     parser.add_argument("--rag_queries_path", type=str, default="data/queries.json")
@@ -79,4 +79,13 @@ def get_fine_tuning_args():
     )
     parser.add_argument("--retriever_top_k", type=int, default=5)
     parser.add_argument("--decoder_max_length", type=int, default=256)
+    parser.add_argument(
+        "--show_retrieval_preview",
+        action="store_true",
+        help=(
+            "Enable verbose FAISS retrieval previews during evaluation checkpoints. When set, "
+            "the script prints a sample query from the evaluation split along with the "
+            "retrieved document ids and text snippets at every evaluation step."
+        ),
+    )
     return parser.parse_args()

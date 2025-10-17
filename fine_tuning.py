@@ -3,17 +3,20 @@ import math
 import os
 import random
 import shutil
+import textwrap
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
+import faiss
+import h5py
 import numpy as np
 import torch
 from accelerate import Accelerator
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments, TrainerCallback
-from analyse.retrieval import CosineRetriever, TextEmbedder
+from analyse.retrieval import TextEmbedder
 from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
 from metrics import exact_match_score, f1_score
@@ -37,46 +40,175 @@ def _to_str_doc_id(doc_id: object) -> str:
 
 
 def load_context_store(path: str) -> Dict[str, torch.Tensor]:
-    raw_contexts = torch.load(path, map_location="cpu")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Context store not found at {path}")
+
     context_store: Dict[str, torch.Tensor] = {}
-    for doc_id, payload in raw_contexts.items():
-        key = _to_str_doc_id(doc_id)
-        context_tensor = payload.get("context") if isinstance(payload, dict) else payload
-        if not isinstance(context_tensor, torch.Tensor):
-            context_tensor = torch.as_tensor(context_tensor)
-        # Compressors output tensors of shape (1, mem_tokens, hidden)
-        if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
-            context_tensor = context_tensor.squeeze(0)
-        context_store[key] = context_tensor.to(torch.float32)
+
+    with h5py.File(path, "r") as handle:
+        contexts_ds = handle["contexts"]
+        shapes_ds = handle["shapes"]
+        doc_ids_raw = handle["doc_ids"]
+
+        doc_ids: List[str] = []
+        for raw_id in doc_ids_raw:
+            doc_ids.append(_to_str_doc_id(raw_id))
+
+        if len(contexts_ds) != len(doc_ids) or len(shapes_ds) != len(doc_ids):
+            raise ValueError("Mismatch between contexts, shapes, and doc id entries in context store")
+
+        for idx, doc_id in enumerate(doc_ids):
+            flattened = np.asarray(contexts_ds[idx], dtype=np.float32)
+            shape_arr = np.asarray(shapes_ds[idx], dtype=np.int64)
+            shape = tuple(int(dim) for dim in shape_arr.tolist())
+            if not shape:
+                raise ValueError(f"Missing shape information for context index {idx}")
+
+            context_array = flattened.reshape(shape)
+            context_tensor = torch.from_numpy(context_array)
+
+            if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
+                context_tensor = context_tensor.squeeze(0)
+
+            context_store[doc_id] = context_tensor.to(torch.float32)
+
     return context_store
 
 
-def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> CosineRetriever:
+@dataclass
+class FaissRetriever:
+    index: "faiss.Index"
+    index_to_doc_id: List[str]
+    doc_id_to_index: Dict[str, int]
+
+    def search(self, query: str, query_embedder: TextEmbedder, k: int = 5) -> List[str]:
+        query_embedding = query_embedder.encode([query])[0].astype(np.float32)
+        norm = float(np.linalg.norm(query_embedding))
+        if norm > 0:
+            query_embedding /= norm
+        _scores, indices = self.index.search(query_embedding[None, :], k)
+        doc_ids: List[str] = []
+        if indices.size:
+            for idx in indices[0]:
+                if idx < 0 or idx >= len(self.index_to_doc_id):
+                    continue
+                doc_ids.append(self.index_to_doc_id[idx])
+        return doc_ids
+
+
+def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> FaissRetriever:
     with np.load(embeddings_path) as embeddings_file:
         doc_ids = [_to_str_doc_id(doc_id) for doc_id in embeddings_file["doc_ids"]]
         embeddings = embeddings_file["embeddings"]
 
-    docs: Dict[str, Dict[str, str]] = {}
-    if docs_path and os.path.exists(docs_path):
-        with open(docs_path, "r", encoding="utf-8") as handle:
-            docs = json.load(handle)
+    if embeddings.shape[0] != len(doc_ids):
+        raise ValueError("Number of embeddings does not match number of document IDs.")
 
-    store: Dict[str, Dict[str, str]] = {}
-    for doc_id in doc_ids:
-        doc_payload = docs.get(doc_id)
-        if doc_payload is None:
-            try:
-                numeric_key = str(int(float(doc_id)))
-            except Exception:
-                numeric_key = None
-            if numeric_key is not None:
-                doc_payload = docs.get(numeric_key)
-        text = ""
-        if isinstance(doc_payload, dict):
-            text = doc_payload.get("text", "")
-        store[doc_id] = {"text": text}
+    embeddings = np.ascontiguousarray(embeddings.astype(np.float32))
+    faiss.normalize_L2(embeddings)
 
-    return CosineRetriever(embeddings=embeddings, doc_ids=doc_ids, store=store)
+    index = faiss.IndexFlatIP(embeddings.shape[1])
+    index.add(embeddings)
+
+    index_to_doc_id = list(doc_ids)
+    doc_id_to_index = {doc_id: idx for idx, doc_id in enumerate(index_to_doc_id)}
+
+    return FaissRetriever(index=index, index_to_doc_id=index_to_doc_id, doc_id_to_index=doc_id_to_index)
+
+
+def _extract_doc_text(payload: object) -> Optional[str]:
+    if payload is None:
+        return None
+    if isinstance(payload, str):
+        text = payload.strip()
+        return text or None
+    if isinstance(payload, dict):
+        for key in ("text", "contents", "content", "body", "document", "passage"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        for value in payload.values():
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def load_docs_lookup(docs_path: Optional[str]) -> Dict[str, str]:
+    if not docs_path or not os.path.exists(docs_path):
+        return {}
+
+    with open(docs_path, "r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+
+    lookup: Dict[str, str] = {}
+    if isinstance(payload, dict):
+        for doc_id, value in payload.items():
+            text = _extract_doc_text(value)
+            if text:
+                lookup[_to_str_doc_id(doc_id)] = text
+    elif isinstance(payload, list):
+        for entry in payload:
+            if not isinstance(entry, dict):
+                continue
+            doc_id = entry.get("doc_id") or entry.get("id") or entry.get("document_id")
+            if doc_id is None:
+                continue
+            text = _extract_doc_text(entry)
+            if text:
+                lookup[_to_str_doc_id(doc_id)] = text
+    return lookup
+
+
+def _format_doc_preview(text: str, max_lines: int = 3, max_chars: int = 200) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    selected = lines[:max_lines]
+    preview = "\n".join(selected)
+    if len(preview) > max_chars:
+        preview = preview[: max_chars - 3].rstrip() + "..."
+    return preview
+
+
+def preview_retrieval(
+    split_name: str,
+    examples: List[Dict[str, object]],
+    retriever: FaissRetriever,
+    query_embedder: TextEmbedder,
+    docs_lookup: Dict[str, str],
+    top_k: int,
+) -> None:
+    if not examples:
+        print(f"No examples available in the {split_name} split for retrieval preview.")
+        return
+
+    sample = random.choice(examples)
+    question = sample.get("question") or sample.get("query") or ""
+    if not question:
+        print(f"Selected example from {split_name} split does not contain a question.")
+        return
+
+    retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
+
+    print("\n=== Retrieval preview ({split}) ===".format(split=split_name))
+    print(f"Query: {question}")
+    if not retrieved_doc_ids:
+        print("No documents retrieved for the preview query.")
+        return
+
+    for rank, doc_id in enumerate(retrieved_doc_ids, start=1):
+        doc_key = _to_str_doc_id(doc_id)
+        print(f"{rank}. doc_id={doc_key}")
+        doc_text = docs_lookup.get(doc_key)
+        if not doc_text:
+            print("   [document text unavailable]")
+            continue
+        preview = _format_doc_preview(doc_text)
+        if preview:
+            indented = textwrap.indent(preview, prefix="   ")
+            print(indented)
+        else:
+            print("   [document text unavailable]")
 
 
 def _flatten_answer_texts(payload: object) -> List[str]:
@@ -305,7 +437,7 @@ class RAGFineTuneDataset(Dataset):
     def __init__(
         self,
         qa_split: Iterable[Dict],
-        retriever: CosineRetriever,
+        retriever: FaissRetriever,
         query_embedder: TextEmbedder,
         context_store: Dict[str, torch.Tensor],
         top_k: int,
@@ -320,9 +452,9 @@ class RAGFineTuneDataset(Dataset):
             if not question:
                 continue
             answer = _extract_answer(example)
-            hits = retriever.search(question, query_embedder, k=top_k)
+            retrieved_doc_ids = retriever.search(question, query_embedder, k=top_k)
             doc_ids: List[str] = []
-            for doc_id, _score, _text in hits:
+            for doc_id in retrieved_doc_ids:
                 key = _to_str_doc_id(doc_id)
                 if key in context_store:
                     doc_ids.append(key)
@@ -528,6 +660,41 @@ class FineTuningTrainer(Trainer):
             super().save_model(output_dir=output_dir, _internal_call=_internal_call)
 
 
+class RetrievalPreviewCallback(TrainerCallback):
+    def __init__(
+        self,
+        accelerator: Accelerator,
+        split_name: str,
+        examples: List[Dict[str, object]],
+        retriever: FaissRetriever,
+        query_embedder: TextEmbedder,
+        docs_lookup: Dict[str, str],
+        top_k: int,
+    ) -> None:
+        self.accelerator = accelerator
+        self.split_name = split_name
+        self.examples = examples
+        self.retriever = retriever
+        self.query_embedder = query_embedder
+        self.docs_lookup = docs_lookup
+        self.top_k = top_k
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if not self.accelerator.is_main_process:
+            return control
+        if not self.examples or self.query_embedder is None:
+            return control
+        preview_retrieval(
+            self.split_name,
+            self.examples,
+            self.retriever,
+            self.query_embedder,
+            self.docs_lookup,
+            top_k=self.top_k,
+        )
+        return control
+
+
 def log_save_event(log_path: str, step: int, save_dir: str, event_type: str) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     entry = {
@@ -699,6 +866,10 @@ def main():
         answers_path=args.rag_answers_path,
     )
 
+    docs_lookup = load_docs_lookup(args.rag_docs_path)
+
+    preview_query_embedder = query_embedder if args.show_retrieval_preview else None
+
     train_dataset = RAGFineTuneDataset(
         train_examples,
         retriever,
@@ -714,7 +885,8 @@ def main():
         top_k=args.retriever_top_k,
     )
 
-    del query_embedder
+    if not args.show_retrieval_preview:
+        del query_embedder
 
     if args.checkpoint_path:
         model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
@@ -772,6 +944,19 @@ def main():
         data_collator=data_collator,
         compute_metrics=lambda e: compute_metrics(e, model=model),
     )
+
+    if args.show_retrieval_preview:
+        trainer.add_callback(
+            RetrievalPreviewCallback(
+                accelerator=accelerator,
+                split_name="eval",
+                examples=eval_examples,
+                retriever=retriever,
+                query_embedder=preview_query_embedder,
+                docs_lookup=docs_lookup,
+                top_k=args.retriever_top_k,
+            )
+        )
 
     trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)
 
