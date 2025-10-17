@@ -142,12 +142,20 @@ def resolve_base_compression_rate(model: COCOM, fallback_rate: int) -> int:
 
 
 def generate_contexts(
-        docs: Dict[int, Dict[str, str]], model: COCOM, fallback_rate: int
+        docs: Dict[int, Dict[str, str]],
+        model: COCOM,
+        fallback_rate: int,
+        batch_size: Optional[int] = None,
 ) -> Dict[int, Dict[str, Any]]:
     try:
         device = next(model.parameters()).device
     except StopIteration:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if batch_size is None:
+        batch_size = getattr(model, "context_batch_size", None)
+    if batch_size is None or batch_size <= 0:
+        batch_size = 8
 
     contexts: Dict[int, Dict[str, Any]] = {}
     agent = getattr(model, "bandit_agent", None)
@@ -163,61 +171,102 @@ def generate_contexts(
         except Exception:
             model.current_rate = fallback_rate
 
-    # Add progress bar
-    pbar = tqdm(docs.items(), total=len(docs), desc="Generating contexts")
+    doc_items = list(docs.items())
+    pad_token_id = model.compr.tokenizer.pad_token_id
+    if pad_token_id is None:
+        pad_token_id = (
+            model.compr.tokenizer.eos_token_id
+            if model.compr.tokenizer.eos_token_id is not None
+            else 0
+        )
 
-    for doc_id, item in pbar:
+    pbar = tqdm(total=len(doc_items), desc="Generating contexts")
+
+    for batch_start in range(0, len(doc_items), batch_size):
+        batch_slice = doc_items[batch_start: batch_start + batch_size]
+        batch_doc_ids = [doc_id for doc_id, _ in batch_slice]
+        batch_queries = [item["query_id"] for _, item in batch_slice]
+        texts = [item["text"] for _, item in batch_slice]
+
         tokens = model.compr.tokenizer(
-            item["text"],
+            texts,
             return_tensors="pt",
             truncation=True,
             max_length=512,
-            padding="max_length",  # Add padding to fix size issues
+            padding="longest",
         )
-        selected_rate = fallback_rate
-        entropy: Optional[float] = None
-        length: Optional[float] = None
+
+        entropies: Optional[List[float]] = None
+        lengths: Optional[List[float]] = None
+
         if agent is not None:
-            entropy = batch_entropy(tokens["input_ids"], tokens["attention_mask"])[0]
+            entropy_tensor = batch_entropy(tokens["input_ids"], tokens["attention_mask"])
+            entropies = [float(val) for val in entropy_tensor.tolist()]
             if agent.use_length_feature:
-                length = float(tokens["attention_mask"].sum().item())
-            try:
-                selected_rate = agent.select_rate(float(entropy), length)
-            except Exception:
-                selected_rate = fallback_rate
+                length_tensor = tokens["attention_mask"].sum(dim=1).to(dtype=torch.float32)
+                lengths = [float(val) for val in length_tensor.tolist()]
 
-        pad_token_id = model.compr.tokenizer.pad_token_id
-        if pad_token_id is None:
-            pad_token_id = (
-                model.compr.tokenizer.eos_token_id
-                if model.compr.tokenizer.eos_token_id is not None
-                else 0
+        doc_infos: List[Dict[str, Any]] = []
+        rate_to_indices: Dict[int, List[int]] = {}
+
+        for idx, doc_id in enumerate(batch_doc_ids):
+            entropy_val = entropies[idx] if entropies is not None else None
+            length_val = lengths[idx] if lengths is not None else None
+            selected_rate = fallback_rate
+            if agent is not None:
+                try:
+                    selected_rate = agent.select_rate(entropy_val, length_val)
+                except Exception:
+                    selected_rate = fallback_rate
+
+            doc_infos.append(
+                {
+                    "doc_id": doc_id,
+                    "query_id": batch_queries[idx],
+                    "rate": selected_rate,
+                    "entropy": entropy_val,
+                    "length": length_val,
+                }
             )
-        tokens = pad_tokens_to_rate(tokens, selected_rate, pad_token_id)
-        tokens = {k: v.to(device) for k, v in tokens.items()}
+            rate_to_indices.setdefault(selected_rate, []).append(idx)
 
-        with torch.no_grad():
-            emb = model.compr(
-                input_ids=tokens["input_ids"],
-                attention_mask=tokens["attention_mask"],
-                rate=selected_rate,
-            )
-        context_tensor = emb.detach().cpu()
-        contexts[doc_id] = {
-            "query_id": item["query_id"],
-            "context": context_tensor,
-            "compression_rate": selected_rate,
-        }
-        if entropy is not None:
-            contexts[doc_id]["entropy"] = entropy
-        if length is not None:
-            contexts[doc_id]["length"] = length
+        for rate, indices in rate_to_indices.items():
+            rate_tokens = {
+                key: value[indices].contiguous()
+                for key, value in tokens.items()
+            }
+            rate_tokens = pad_tokens_to_rate(rate_tokens, rate, pad_token_id)
+            rate_tokens = {k: v.to(device) for k, v in rate_tokens.items()}
 
-        # Update progress description
-        postfix = {"rate": selected_rate, "entropy": entropy, "agent": agent_name}
-        if length is not None:
-            postfix["length"] = length
-        pbar.set_postfix(postfix)
+            with torch.no_grad():
+                batch_emb = model.compr(
+                    input_ids=rate_tokens["input_ids"],
+                    attention_mask=rate_tokens["attention_mask"],
+                    rate=rate,
+                )
+
+            for idx_in_rate, context_tensor in zip(indices, batch_emb.detach().cpu()):
+                info = doc_infos[idx_in_rate]
+                payload: Dict[str, Any] = {
+                    "query_id": info["query_id"],
+                    "context": context_tensor,
+                    "compression_rate": info["rate"],
+                }
+                if info["entropy"] is not None:
+                    payload["entropy"] = info["entropy"]
+                if info["length"] is not None:
+                    payload["length"] = info["length"]
+
+                contexts[info["doc_id"]] = payload
+                postfix = {
+                    "rate": info["rate"],
+                    "entropy": info["entropy"],
+                    "agent": agent_name,
+                }
+                if info["length"] is not None:
+                    postfix["length"] = info["length"]
+                pbar.update(1)
+                pbar.set_postfix(postfix)
 
     return contexts
 
