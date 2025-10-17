@@ -60,6 +60,7 @@ def get_fine_tuning_args():
     parser.add_argument("--rag_embeddings_path", type=str, default="data/embeddings/embeddings.npz")
     parser.add_argument("--rag_docs_path", type=str, default="data/docs.json")
     parser.add_argument("--rag_queries_path", type=str, default="data/queries.json")
+    parser.add_argument("--rag_query_embeddings_path", type=str, default="data/query_embeddings.npz")
     parser.add_argument(
         "--rag_answers_path",
         type=str,

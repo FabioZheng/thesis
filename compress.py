@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contexts_out", help="Directory to save compressed contexts", default="data/contexts")
     parser.add_argument("--embeddings_out", help="Directory to save document embeddings", default="data/embeddings")
     parser.add_argument(
+        "--query-embeddings-out",
+        help="Directory to save query embeddings",
+        default="data",
+    )
+    parser.add_argument(
         "--use-bandit",
         dest="use_bandit",
         action="store_true",
@@ -362,20 +367,10 @@ def save_contexts(
     return path, memory_stats
 
 
-def generate_embeddings(
+def generate_doc_embeddings(
     docs: Dict[int, Dict[str, str]],
-    model_name: str,
-    batch_size: int,
-    device: Optional[str],
-    normalize: bool,
+    embedder: TextEmbedder,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    embedder = TextEmbedder(
-        model_name=model_name,
-        batch_size=batch_size,
-        device=device,
-        normalize=normalize,
-    )
-
     doc_ids: List[int] = sorted(docs.keys())
     texts: List[str] = [docs[doc_id]["text"] for doc_id in doc_ids]
     query_ids: List[Any] = [docs[doc_id]["query_id"] for doc_id in doc_ids]
@@ -385,6 +380,53 @@ def generate_embeddings(
     return (
         np.asarray(doc_ids, dtype=np.int64),
         np.asarray([str(qid) for qid in query_ids], dtype=np.str_),
+        np.asarray(embeddings_array, dtype=np.float32),
+    )
+
+
+def _sorted_query_items(
+    queries: Dict[Any, Dict[str, Any]]
+) -> List[Tuple[str, Dict[str, Any]]]:
+    def _normalise_key(key: Any) -> Tuple[int, Any]:
+        try:
+            numeric = int(str(key))
+            return (0, numeric)
+        except Exception:
+            return (1, str(key))
+
+    items: List[Tuple[str, Dict[str, Any]]] = []
+    for key, value in queries.items():
+        items.append((str(key), value if isinstance(value, dict) else {"text": value}))
+    return sorted(items, key=lambda item: _normalise_key(item[0]))
+
+
+def generate_query_embeddings(
+    queries: Dict[Any, Dict[str, Any]],
+    embedder: TextEmbedder,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ordered_items = _sorted_query_items(queries)
+
+    query_ids: List[str] = []
+    query_texts: List[str] = []
+    for query_id, payload in ordered_items:
+        text = ""
+        if isinstance(payload, dict):
+            text_val = payload.get("text")
+            if isinstance(text_val, str):
+                text = text_val.strip()
+        if not text:
+            continue
+        query_ids.append(query_id)
+        query_texts.append(text)
+
+    if not query_ids:
+        raise ValueError("No queries with textual content were provided for embedding.")
+
+    embeddings_array = embedder.encode(query_texts)
+
+    return (
+        np.asarray(query_ids, dtype=np.str_),
+        np.asarray(query_texts, dtype=np.str_),
         np.asarray(embeddings_array, dtype=np.float32),
     )
 
@@ -403,6 +445,30 @@ def save_embeddings_npz(
         output_path,
         doc_ids=doc_ids,
         query_ids=query_ids,
+        embeddings=embeddings,
+    )
+
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    memory_stats: Dict[str, Any] = {
+        "embeddings_shape": tuple(int(dim) for dim in embeddings.shape),
+        "approx_disk_mb": file_size_mb,
+    }
+    return output_path, memory_stats
+
+
+def save_query_embeddings_npz(
+    query_ids: np.ndarray,
+    query_texts: np.ndarray,
+    embeddings: np.ndarray,
+    output_dir: str,
+    filename: str = "query_embeddings.npz",
+) -> Tuple[str, Dict[str, Any]]:
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, filename)
+    np.savez_compressed(
+        output_path,
+        query_ids=query_ids,
+        query_texts=query_texts,
         embeddings=embeddings,
     )
 
@@ -529,13 +595,14 @@ def main() -> None:
         )
     )
 
-    doc_ids, query_ids, embeddings = generate_embeddings(
-        docs,
-        args.embedder_model,
-        args.embedder_batch_size,
-        args.embedder_device,
-        not args.no_embedder_normalize,
+    embedder = TextEmbedder(
+        model_name=args.embedder_model,
+        batch_size=args.embedder_batch_size,
+        device=args.embedder_device,
+        normalize=not args.no_embedder_normalize,
     )
+
+    doc_ids, query_ids, embeddings = generate_doc_embeddings(docs, embedder)
     emb_path, emb_mem = save_embeddings_npz(
         doc_ids,
         query_ids,
@@ -549,6 +616,34 @@ def main() -> None:
             path=emb_path,
             shape=emb_mem.get("embeddings_shape"),
             disk=emb_mem.get("approx_disk_mb", 0.0),
+        )
+    )
+
+    with open(queries_path, "r", encoding="utf-8") as handle:
+        queries_payload = json.load(handle)
+
+    query_ids_array, query_texts_array, query_embeddings = generate_query_embeddings(
+        queries_payload,
+        embedder,
+    )
+
+    query_embeddings_dir = (
+        args.query_embeddings_out if args.query_embeddings_out is not None else args.embeddings_out
+    )
+
+    query_emb_path, query_emb_mem = save_query_embeddings_npz(
+        query_ids_array,
+        query_texts_array,
+        query_embeddings,
+        query_embeddings_dir,
+    )
+    print(
+        "Generated embeddings for {count} queries -> {path} "
+        "(shape: {shape}, approx disk: {disk:.2f} MB)".format(
+            count=len(query_ids_array),
+            path=query_emb_path,
+            shape=query_emb_mem.get("embeddings_shape"),
+            disk=query_emb_mem.get("approx_disk_mb", 0.0),
         )
     )
 
