@@ -660,6 +660,41 @@ class FineTuningTrainer(Trainer):
             super().save_model(output_dir=output_dir, _internal_call=_internal_call)
 
 
+class RetrievalPreviewCallback(TrainerCallback):
+    def __init__(
+        self,
+        accelerator: Accelerator,
+        split_name: str,
+        examples: List[Dict[str, object]],
+        retriever: FaissRetriever,
+        query_embedder: TextEmbedder,
+        docs_lookup: Dict[str, str],
+        top_k: int,
+    ) -> None:
+        self.accelerator = accelerator
+        self.split_name = split_name
+        self.examples = examples
+        self.retriever = retriever
+        self.query_embedder = query_embedder
+        self.docs_lookup = docs_lookup
+        self.top_k = top_k
+
+    def on_evaluate(self, args, state, control, **kwargs):
+        if not self.accelerator.is_main_process:
+            return control
+        if not self.examples or self.query_embedder is None:
+            return control
+        preview_retrieval(
+            self.split_name,
+            self.examples,
+            self.retriever,
+            self.query_embedder,
+            self.docs_lookup,
+            top_k=self.top_k,
+        )
+        return control
+
+
 def log_save_event(log_path: str, step: int, save_dir: str, event_type: str) -> None:
     os.makedirs(os.path.dirname(log_path), exist_ok=True)
     entry = {
@@ -833,22 +868,7 @@ def main():
 
     docs_lookup = load_docs_lookup(args.rag_docs_path)
 
-    if args.retrieval_preview_split:
-        split_key = args.retrieval_preview_split.lower()
-        if split_key == "train":
-            preview_examples = train_examples
-        elif split_key == "eval":
-            preview_examples = eval_examples
-        else:
-            preview_examples = []
-        preview_retrieval(
-            split_key,
-            preview_examples,
-            retriever,
-            query_embedder,
-            docs_lookup,
-            top_k=args.retriever_top_k,
-        )
+    preview_query_embedder = query_embedder if args.show_retrieval_preview else None
 
     train_dataset = RAGFineTuneDataset(
         train_examples,
@@ -865,7 +885,8 @@ def main():
         top_k=args.retriever_top_k,
     )
 
-    del query_embedder
+    if not args.show_retrieval_preview:
+        del query_embedder
 
     if args.checkpoint_path:
         model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
@@ -923,6 +944,19 @@ def main():
         data_collator=data_collator,
         compute_metrics=lambda e: compute_metrics(e, model=model),
     )
+
+    if args.show_retrieval_preview:
+        trainer.add_callback(
+            RetrievalPreviewCallback(
+                accelerator=accelerator,
+                split_name="eval",
+                examples=eval_examples,
+                retriever=retriever,
+                query_embedder=preview_query_embedder,
+                docs_lookup=docs_lookup,
+                top_k=args.retriever_top_k,
+            )
+        )
 
     trainer.create_optimizer_and_scheduler(num_training_steps=total_steps)
 
