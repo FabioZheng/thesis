@@ -200,8 +200,8 @@ def generate_contexts(
         lengths: Optional[List[float]] = None
 
         if agent is not None:
-            entropy_tensor = batch_entropy(tokens["input_ids"], tokens["attention_mask"])
-            entropies = [float(val) for val in entropy_tensor.tolist()]
+            entropy_values = batch_entropy(tokens["input_ids"], tokens["attention_mask"])
+            entropies = [float(val) for val in entropy_values]
             if agent.use_length_feature:
                 length_tensor = tokens["attention_mask"].sum(dim=1).to(dtype=torch.float32)
                 lengths = [float(val) for val in length_tensor.tolist()]
