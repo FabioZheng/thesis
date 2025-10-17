@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Dict, Iterable, List, Optional, Tuple
 
 import faiss
+import h5py
 import numpy as np
 import torch
 from accelerate import Accelerator
@@ -39,17 +40,38 @@ def _to_str_doc_id(doc_id: object) -> str:
 
 
 def load_context_store(path: str) -> Dict[str, torch.Tensor]:
-    raw_contexts = torch.load(path, map_location="cpu")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Context store not found at {path}")
+
     context_store: Dict[str, torch.Tensor] = {}
-    for doc_id, payload in raw_contexts.items():
-        key = _to_str_doc_id(doc_id)
-        context_tensor = payload.get("context") if isinstance(payload, dict) else payload
-        if not isinstance(context_tensor, torch.Tensor):
-            context_tensor = torch.as_tensor(context_tensor)
-        # Compressors output tensors of shape (1, mem_tokens, hidden)
-        if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
-            context_tensor = context_tensor.squeeze(0)
-        context_store[key] = context_tensor.to(torch.float32)
+
+    with h5py.File(path, "r") as handle:
+        contexts_ds = handle["contexts"]
+        shapes_ds = handle["shapes"]
+        doc_ids_raw = handle["doc_ids"]
+
+        doc_ids: List[str] = []
+        for raw_id in doc_ids_raw:
+            doc_ids.append(_to_str_doc_id(raw_id))
+
+        if len(contexts_ds) != len(doc_ids) or len(shapes_ds) != len(doc_ids):
+            raise ValueError("Mismatch between contexts, shapes, and doc id entries in context store")
+
+        for idx, doc_id in enumerate(doc_ids):
+            flattened = np.asarray(contexts_ds[idx], dtype=np.float32)
+            shape_arr = np.asarray(shapes_ds[idx], dtype=np.int64)
+            shape = tuple(int(dim) for dim in shape_arr.tolist())
+            if not shape:
+                raise ValueError(f"Missing shape information for context index {idx}")
+
+            context_array = flattened.reshape(shape)
+            context_tensor = torch.from_numpy(context_array)
+
+            if context_tensor.dim() == 3 and context_tensor.size(0) == 1:
+                context_tensor = context_tensor.squeeze(0)
+
+            context_store[doc_id] = context_tensor.to(torch.float32)
+
     return context_store
 
 

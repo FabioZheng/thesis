@@ -56,7 +56,7 @@ def get_fine_tuning_args():
         default=None,
         help="Optional override for the compression projection layout when not using the pretrained value.",
     )
-    parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.pt")
+    parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.h5")
     parser.add_argument("--rag_embeddings_path", type=str, default="data/embeddings/embeddings.npz")
     parser.add_argument("--rag_docs_path", type=str, default="data/docs.json")
     parser.add_argument("--rag_queries_path", type=str, default="data/queries.json")

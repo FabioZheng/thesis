@@ -1,8 +1,10 @@
 import argparse
+import json
 import os
 import pickle
 from typing import Any, Dict, List, Optional, Tuple
 
+import h5py
 import torch
 import numpy as np
 
@@ -220,40 +222,87 @@ def generate_contexts(
     return contexts
 
 
-def _estimate_context_memory_mb(contexts: Dict[int, Dict[str, Any]]) -> float:
-    total_bytes = 0
-    for item in contexts.values():
-        context = item.get("context")
-        if isinstance(context, torch.Tensor):
-            total_bytes += context.element_size() * context.nelement()
-        elif context is not None:
-            tensor = torch.as_tensor(context)
-            total_bytes += tensor.element_size() * tensor.nelement()
-    return total_bytes / (1024 * 1024)
-
-
 def save_contexts(
-    contexts: Dict[int, Dict[str, Any]], directory: str, filename: str = "contexts.pt"
+    contexts: Dict[int, Dict[str, Any]], directory: str, filename: str = "contexts.h5"
 ) -> Tuple[str, Dict[str, Any]]:
     os.makedirs(directory, exist_ok=True)
-    path = os.path.join(directory, filename)
 
-    serialisable_contexts: Dict[int, Dict[str, Any]] = {}
-    for doc_id, payload in contexts.items():
+    path = os.path.join(directory, filename)
+    index_path = os.path.join(directory, os.path.splitext(filename)[0] + "_index.json")
+    metadata_path = os.path.join(directory, os.path.splitext(filename)[0] + "_metadata.json")
+
+    doc_items = sorted(
+        contexts.items(),
+        key=lambda kv: (
+            int(kv[0]) if isinstance(kv[0], (int, np.integer)) else str(kv[0])
+        ),
+    )
+
+    doc_ids: List[str] = []
+    flattened_contexts: List[np.ndarray] = []
+    shapes: List[Tuple[int, ...]] = []
+    metadata: Dict[str, Dict[str, Any]] = {}
+    approx_bytes = 0
+
+    for doc_id, payload in doc_items:
         context = payload.get("context")
         if context is None:
             raise ValueError(f"Missing context tensor for document id {doc_id}")
-        tensor_context = context.cpu() if isinstance(context, torch.Tensor) else torch.as_tensor(context)
-        serialisable_contexts[doc_id] = {
-            **payload,
-            "context": tensor_context,
-        }
 
-    torch.save(serialisable_contexts, path)
+        tensor_context = (
+            context.detach().cpu() if isinstance(context, torch.Tensor) else torch.as_tensor(context)
+        )
+        tensor_context = tensor_context.to(torch.float32).contiguous()
+
+        approx_bytes += tensor_context.element_size() * tensor_context.nelement()
+
+        np_context = tensor_context.numpy().reshape(-1).astype(np.float32, copy=True)
+        flattened_contexts.append(np_context)
+        shapes.append(tuple(int(dim) for dim in tensor_context.shape))
+
+        doc_id_str = str(doc_id)
+        doc_ids.append(doc_id_str)
+        metadata_payload: Dict[str, Any] = {}
+        for key, value in payload.items():
+            if key == "context":
+                continue
+            if isinstance(value, (np.integer, np.int64, np.int32)):
+                metadata_payload[key] = int(value)
+            elif isinstance(value, (np.floating, np.float32, np.float64)):
+                metadata_payload[key] = float(value)
+            elif isinstance(value, torch.Tensor):
+                metadata_payload[key] = value.detach().cpu().tolist()
+            else:
+                metadata_payload[key] = value
+        metadata[doc_id_str] = metadata_payload
+
+    with h5py.File(path, "w") as h5:
+        context_dtype = h5py.vlen_dtype(np.dtype("float32"))
+        contexts_ds = h5.create_dataset("contexts", (len(flattened_contexts),), dtype=context_dtype)
+        for idx, np_context in enumerate(flattened_contexts):
+            contexts_ds[idx] = np_context
+
+        shape_dtype = h5py.vlen_dtype(np.dtype("int32"))
+        shapes_ds = h5.create_dataset("shapes", (len(shapes),), dtype=shape_dtype)
+        for idx, shape in enumerate(shapes):
+            shapes_ds[idx] = np.asarray(shape, dtype=np.int32)
+
+        doc_id_dtype = h5py.string_dtype(encoding="utf-8")
+        h5.create_dataset("doc_ids", (len(doc_ids),), dtype=doc_id_dtype, data=doc_ids)
+
+    with open(index_path, "w", encoding="utf-8") as index_handle:
+        json.dump(doc_ids, index_handle)
+
+    with open(metadata_path, "w", encoding="utf-8") as metadata_handle:
+        json.dump(metadata, metadata_handle, ensure_ascii=False)
 
     memory_stats: Dict[str, Any] = {
-        "approx_memory_mb": _estimate_context_memory_mb(serialisable_contexts),
-        "pt_disk_mb": os.path.getsize(path) / (1024 * 1024),
+        "approx_memory_mb": approx_bytes / (1024 * 1024),
+        "h5_disk_mb": os.path.getsize(path) / (1024 * 1024),
+        "index_disk_mb": os.path.getsize(index_path) / (1024 * 1024),
+        "metadata_disk_mb": os.path.getsize(metadata_path) / (1024 * 1024),
+        "index_path": index_path,
+        "metadata_path": metadata_path,
     }
     return path, memory_stats
 
@@ -406,15 +455,22 @@ def main() -> None:
     print(f"Compression configuration -> agent={agent_name}, base_rate={base_rate}")
 
     contexts = generate_contexts(docs, model, base_rate)
-    contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.pt")
+    contexts_path, ctx_mem = save_contexts(contexts, args.contexts_out, "contexts.h5")
     print(
         "Generated contexts for {count} MS MARCO passages using model {model_src} -> {path} "
-        "(approx memory: {mem:.2f} MB, disk: {disk:.2f} MB)".format(
+        "(approx memory: {mem:.2f} MB, h5: {h5:.2f} MB, index: {index:.2f} MB, metadata: {meta:.2f} MB)".format(
             count=len(contexts),
             model_src=model_source,
             path=contexts_path,
             mem=ctx_mem.get("approx_memory_mb", 0.0),
-            disk=ctx_mem.get("pt_disk_mb", 0.0),
+            h5=ctx_mem.get("h5_disk_mb", 0.0),
+            index=ctx_mem.get("index_disk_mb", 0.0),
+            meta=ctx_mem.get("metadata_disk_mb", 0.0),
+        )
+    )
+    print(
+        "Context index mapping saved to {index_path}; metadata saved to {metadata_path}".format(
+            index_path=ctx_mem.get("index_path"), metadata_path=ctx_mem.get("metadata_path")
         )
     )
 

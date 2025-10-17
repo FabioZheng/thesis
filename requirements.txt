@@ -5,6 +5,7 @@ flash-attn
 matplotlib
 numpy
 peft
+h5py
 pyserini
 regex
 rouge
