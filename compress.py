@@ -2,12 +2,13 @@ import argparse
 import json
 import os
 import pickle
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import h5py
 import torch
 import numpy as np
 
+from datasets import load_dataset
 from analyse.retrieval import TextEmbedder
 from modeling_cocom import COCOM
 from train_cmab import load_model_safely
@@ -21,7 +22,47 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Generate compressed contexts and embeddings for MS MARCO passages"
     )
-    parser.add_argument("--dataset", help="Path to MS MARCO dataset file (JSON/JSONL)", default="ms_marco_train.json")
+    parser.add_argument(
+        "--dataset",
+        help=(
+            "Path to MS MARCO dataset file (JSON/JSONL). If omitted or when"
+            " --use-hf-dataset is specified the dataset will be streamed from"
+            " the Hugging Face Hub."
+        ),
+        default=None,
+    )
+    parser.add_argument(
+        "--use-hf-dataset",
+        action="store_true",
+        help=(
+            "Download the MS MARCO dataset split from the Hugging Face Hub"
+            " using streaming mode instead of reading a local file."
+        ),
+    )
+    parser.add_argument(
+        "--hf-dataset-name",
+        default="ms_marco",
+        help="Hugging Face dataset identifier to stream (default: 'ms_marco')",
+    )
+    parser.add_argument(
+        "--hf-dataset-config",
+        default="v2.1",
+        help="Optional Hugging Face dataset configuration (default: 'v1.1')",
+    )
+    parser.add_argument(
+        "--hf-dataset-split",
+        default="train",
+        help="Dataset split to stream from Hugging Face (default: 'train')",
+    )
+    parser.add_argument(
+        "--hf-offset",
+        type=int,
+        default=0,
+        help=(
+            "Number of records to skip from the streamed Hugging Face dataset"
+            " before processing."
+        ),
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
@@ -474,10 +515,61 @@ def save_query_embeddings_npz(
     return output_path, memory_stats
 
 
+def _create_dataset_builder(
+    args: argparse.Namespace,
+) -> Tuple[Callable[[], Any], Optional[int], str]:
+    """Prepare a factory that yields the dataset source for processing."""
+
+    use_hf_dataset = args.use_hf_dataset or not args.dataset
+
+    if use_hf_dataset:
+        if args.hf_offset < 0:
+            raise ValueError("--hf-offset must be non-negative")
+
+        def _builder() -> Any:
+            load_kwargs = {"streaming": True}
+            dataset = load_dataset(
+                args.hf_dataset_name,
+                name=args.hf_dataset_config,
+                split=args.hf_dataset_split,
+                **load_kwargs,
+            )
+            dataset = dataset.with_format("python")
+            if args.hf_offset:
+                dataset = dataset.skip(args.hf_offset)
+            if args.limit is not None:
+                dataset = dataset.take(args.limit)
+            return dataset
+
+        dataset_descriptor = "hf://" + args.hf_dataset_name
+        if args.hf_dataset_config:
+            dataset_descriptor += f"/{args.hf_dataset_config}"
+        dataset_descriptor += f":{args.hf_dataset_split}"
+        dataset_descriptor += f" (offset={args.hf_offset}, limit={args.limit})"
+
+        return _builder, None, dataset_descriptor
+
+    if not args.dataset:
+        raise ValueError(
+            "Either provide --dataset or enable --use-hf-dataset to stream"
+            " from the Hugging Face Hub."
+        )
+
+    def _builder() -> Any:
+        return args.dataset
+
+    return _builder, args.limit, args.dataset
+
+
 def main() -> None:
     args = parse_args()
 
-    docs = load_and_flatten(args.dataset, limit=args.limit)
+    dataset_builder, docs_limit, dataset_descriptor = _create_dataset_builder(args)
+
+    print(f"Loading dataset source: {dataset_descriptor}")
+
+    docs_source = dataset_builder()
+    docs = load_and_flatten(docs_source, limit=docs_limit)
     docs = {
         doc_id: {k: v for k, v in payload.items() if k in ("query_id", "text")}
         for doc_id, payload in docs.items()
@@ -499,8 +591,9 @@ def main() -> None:
         for payload in docs.values()
         if payload.get("query_id") is not None
     }
+    queries_source = dataset_builder()
     queries_path, queries_mem = save_queries_json(
-        args.dataset,
+        queries_source,
         args.docs_out,
         "queries.json",
         query_ids=query_ids or None,
@@ -516,8 +609,9 @@ def main() -> None:
         )
     )
 
+    answers_source = dataset_builder()
     answers_path, answers_mem = save_answers_json(
-        args.dataset,
+        answers_source,
         args.docs_out,
         "answers.json",
         query_ids=query_ids or None,

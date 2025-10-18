@@ -92,7 +92,7 @@ ANSWER_CONTAINER_KEYS: Sequence[str] = (
 
 TEXT_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in TEXT_CONTAINER_KEYS)
 NON_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in NON_TEXT_KEYS)
-QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEYS)d
+QUERY_ID_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_ID_KEYS)
 QUERY_TEXT_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in QUERY_TEXT_KEYS)
 ANSWER_CONTAINER_KEYS_LOWER: Tuple[str, ...] = tuple(key.lower() for key in ANSWER_CONTAINER_KEYS)
 
@@ -177,11 +177,15 @@ def _normalise_answer(answer: str) -> str:
 
 
 def _is_placeholder_only_answers(answers: Sequence[str]) -> bool:
+    """Return True when answers contain no substantive response."""
+
     if not answers:
-        return False
+        return True
+
     normalised = [_normalise_answer(answer) for answer in answers if answer.strip()]
     if not normalised:
-        return False
+        return True
+
     return all(answer in NO_ANSWER_PLACEHOLDER_NORMALISED for answer in normalised)
 
 
