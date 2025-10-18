@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import pickle
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 import h5py
 import torch
@@ -22,6 +22,12 @@ def parse_args() -> argparse.Namespace:
         description="Generate compressed contexts and embeddings for MS MARCO passages"
     )
     parser.add_argument("--dataset", help="Path to MS MARCO dataset file (JSON/JSONL)", default="ms_marco_train.json")
+    parser.add_argument(
+        "--offset",
+        type=int,
+        default=0,
+        help="Number of rows to skip before processing the dataset",
+    )
     parser.add_argument(
         "--checkpoint",
         default=None,
@@ -88,6 +94,43 @@ def parse_args() -> argparse.Namespace:
         help="Disable embedding normalization in TextEmbedder",
     )
     return parser.parse_args()
+
+
+def _stream_json_rows_with_offset(
+    path: str, offset: int, limit: Optional[int]
+) -> Iterable[Mapping[str, Any]]:
+    """Stream JSON/JSONL rows, skipping until ``offset`` and yielding up to ``limit``."""
+
+    if offset < 0:
+        raise ValueError("offset must be non-negative")
+
+    processed = 0
+    with open(path, "r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            if index < offset:
+                continue
+
+            stripped = line.strip()
+            if not stripped:
+                continue
+
+            try:
+                row = json.loads(stripped)
+            except json.JSONDecodeError as error:
+                raise ValueError(
+                    f"Failed to parse JSON on line {index + 1} of '{path}'"
+                ) from error
+
+            if not isinstance(row, Mapping):
+                raise ValueError(
+                    "Each row in the dataset must be a mapping after JSON decoding"
+                )
+
+            yield dict(row)
+
+            processed += 1
+            if limit is not None and processed >= limit:
+                break
 
 def load_bandit_agent(path: str, rates: List[int]) -> CompressionBanditAgent:
     with open(path, "rb") as f:
@@ -477,7 +520,23 @@ def save_query_embeddings_npz(
 def main() -> None:
     args = parse_args()
 
-    docs = load_and_flatten(args.dataset, limit=args.limit)
+    stream_factory: Optional[Callable[[], Iterable[Mapping[str, Any]]]] = None
+    dataset_source: Any = args.dataset
+    flatten_limit = args.limit
+
+    if args.offset:
+        if not os.path.isfile(args.dataset):
+            raise FileNotFoundError(
+                f"Dataset file not found for streaming from offset: {args.dataset}"
+            )
+
+        stream_factory = lambda: _stream_json_rows_with_offset(
+            args.dataset, args.offset, args.limit
+        )
+        dataset_source = stream_factory()
+        flatten_limit = None
+
+    docs = load_and_flatten(dataset_source, limit=flatten_limit)
     docs = {
         doc_id: {k: v for k, v in payload.items() if k in ("query_id", "text")}
         for doc_id, payload in docs.items()
@@ -499,8 +558,9 @@ def main() -> None:
         for payload in docs.values()
         if payload.get("query_id") is not None
     }
+    queries_source: Any = stream_factory() if stream_factory is not None else args.dataset
     queries_path, queries_mem = save_queries_json(
-        args.dataset,
+        queries_source,
         args.docs_out,
         "queries.json",
         query_ids=query_ids or None,
@@ -517,7 +577,7 @@ def main() -> None:
     )
 
     answers_path, answers_mem = save_answers_json(
-        args.dataset,
+        stream_factory() if stream_factory is not None else args.dataset,
         args.docs_out,
         "answers.json",
         query_ids=query_ids or None,
