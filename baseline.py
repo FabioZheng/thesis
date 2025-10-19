@@ -1,68 +1,79 @@
-# baseline.py
+# run_evaluation.py
 
 import json
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer
-from tqdm import tqdm
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import csv
+import numpy as np
+import argparse  # New import for command-line arguments
 
-# Import the custom Cocom model definition from your repository
+# --- New Evaluation Imports ---
+# Make sure to install these: pip install bert-score sentence-transformers
 try:
-    from modeling_cocom import CocomForCausalLM
+    from bert_score import score as bert_scorer
+    from sentence_transformers.cross_encoder import CrossEncoder
 except ImportError:
-    print("Error: 'modeling_cocom.py' not found.")
-    print("Please ensure 'baseline.py' is in the same directory as 'modeling_cocom.py'.")
+    print("=" * 50)
+    print("ERROR: Missing required libraries.")
+    print("Please install them by running: pip install bert-score sentence-transformers")
+    print("=" * 50)
     exit(1)
 
 # --- Configuration ---
-MODEL_NAME = "ielabgroup/tinyllama-compression-multi-rate-4-16-128"
+MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+JUDGE_MODEL_NAME = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
+
 DATASET_NAME = "ms_marco"
 DATASET_CONFIG = "v1.1"
-DATASET_SPLIT = "train"  # 'v1.1' only has 'train' and 'test' splits
-N_EXAMPLES = 100  # Number of examples to process from the stream
-MAX_NEW_TOKENS = 128  # Max tokens to generate for an answer
-OUTPUT_FILE = "baseline_results.json"
+DATASET_SPLIT = "train"
+# N_EXAMPLES is now set by command-line argument
+MAX_NEW_TOKENS = 128
 CONTEXT_PREFIX = "use the following document to help answer: "
-# Set a max length for the input to avoid OOM errors, leaving space for generation
-# Cocom's base (GPT-2) is 1024, but let's be safer with RAG prompts.
-# Adjust this based on your available VRAM.
-TOKENIZER_MAX_LENGTH = 1024 - MAX_NEW_TOKENS
+TOKENIZER_MAX_LENGTH = 2048 - MAX_NEW_TOKENS
+
+# --- Output File ---
+OUTPUT_CSV_FILE = "baseline_evaluation_results.csv"
 
 
 # --- Helper Functions ---
 
 def load_model_and_tokenizer(model_name):
-    """Loads the Cocom model and tokenizer."""
+    """Loads the TinyLlama model and tokenizer."""
     print(f"Loading tokenizer: {model_name}")
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    # Set pad token if not present
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = 'left'
 
-    print(f"Loading model: {model_name}")
-    model = CocomForCausalLM.from_pretrained(model_name)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
+    print(f"Loading generation model: {model_name}")
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
     model.eval()
-    print(f"Model loaded on device: {device}")
+    device = model.device
+    print(f"Generation model loaded on device: {device}")
 
     return model, tokenizer, device
 
 
+def load_judge_model(model_name, device):
+    """Loads the Cross-Encoder model to act as a judge."""
+    print(f"Loading judge model: {model_name}")
+    judge_model = CrossEncoder(model_name, max_length=512)
+    print(f"Judge model loaded.")
+    return judge_model
+
+
 def process_example(example):
-    """
-    Extracts query, answer, and context from an ms_marco example,
-    similar to the logic described for save_json.py.
-    """
+    """Extracts query, answer, and context from an ms_marco example."""
     query = example.get('query')
     answers = example.get('answers', [])
+    real_answer = answers[0] if answers else ""
 
-    # Use the first answer as the "real answer"
-    real_answer = answers[0] if answers else "No Answer Provided"
-
-    # Concatenate all passages to form the document context
     passages = example.get('passages', {})
     documents = passages.get('passage_text', [])
     context = " ".join(documents)
@@ -71,18 +82,17 @@ def process_example(example):
 
 
 def generate_answer(model, tokenizer, prompt_text, device):
-    """
-    Generates an answer from the model given a prompt.
-    """
+    """Generates an answer from the model given a prompt."""
+    if not prompt_text:
+        return "[Prompt Error]"
     try:
         inputs = tokenizer(
             prompt_text,
             return_tensors="pt",
             truncation=True,
-            max_length=TOKENIZER_MAX_LENGTH
+            max_length=TOKENIZER_MAX_LENGTH,
+            padding=True
         ).to(device)
-
-        input_length = inputs.input_ids.shape[1]
 
         with torch.no_grad():
             output_sequences = model.generate(
@@ -94,9 +104,9 @@ def generate_answer(model, tokenizer, prompt_text, device):
                 pad_token_id=tokenizer.pad_token_id
             )
 
-        # Decode only the newly generated tokens
-        generated_tokens = output_sequences[0][input_length:]
-        answer = tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
+        full_text = tokenizer.batch_decode(output_sequences, skip_special_tokens=True)[0]
+        prompt_text_decoded = tokenizer.decode(inputs.input_ids[0], skip_special_tokens=True)
+        answer = full_text[len(prompt_text_decoded):].strip()
 
         return answer
 
@@ -105,10 +115,85 @@ def generate_answer(model, tokenizer, prompt_text, device):
         return "[Generation Error]"
 
 
+def format_chat_prompt(tokenizer, messages):
+    """Applies the model's chat template to a list of messages."""
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+    except Exception as e:
+        print(f"Error formatting chat prompt: {e}")
+        return ""
+
+
+def get_bert_score(candidate, reference, device):
+    """Calculates BERTScore F1."""
+    if not candidate or not reference:
+        return 0.0
+    try:
+        # Suppress BERTScore warnings
+        _, _, f1 = bert_scorer([candidate], [reference], lang='en', device=device, verbose=False)
+        return f1.item()
+    except Exception as e:
+        print(f"Error calculating BERTScore: {e}")
+        return 0.0
+
+
+def get_judge_score(judge_model, pair_list):
+    """Gets a relevance/faithfulness score from the judge model."""
+    valid_pairs = [(str(a), str(b)) for a, b in pair_list if a and b]
+    if not valid_pairs:
+        return [0.0] * len(pair_list)
+
+    try:
+        return judge_model.predict(valid_pairs, show_progress_bar=False)
+    except Exception as e:
+        print(f"Error getting judge score: {e}")
+        return [0.0] * len(pair_list)
+
+
+def save_results_csv(results, filename):
+    """Saves all results to a single CSV file."""
+    if not results:
+        print("No results to save to CSV.")
+        return
+
+    print(f"\nSaving results to {filename}...")
+    # These headers include the text and all scores for a complete record
+    headers = [
+        "query_id", "bert_f1_query_only", "bert_f1_rag", "relevancy_rag", "faithfulness_rag"
+    ]
+
+    try:
+        with open(filename, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=headers, extrasaction='ignore')
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+        print("CSV results saved successfully.")
+    except Exception as e:
+        print(f"Error saving CSV file: {e}")
+
+
 # --- Main Execution ---
 
 def main():
+    # --- NEW: Parse command-line arguments ---
+    parser = argparse.ArgumentParser(description="Run RAG baseline evaluation on ms_marco.")
+    parser.add_argument(
+        "-n", "--num_samples",
+        type=int,
+        default=100,
+        help="Number of samples to evaluate from the dataset."
+    )
+    args = parser.parse_args()
+    N_EXAMPLES = args.num_samples
+    # --- End of new argument parsing ---
+
     model, tokenizer, device = load_model_and_tokenizer(MODEL_NAME)
+    judge_model = load_judge_model(JUDGE_MODEL_NAME, device)
 
     print(f"\nLoading and streaming dataset: {DATASET_NAME} ({DATASET_CONFIG})")
     dataset = load_dataset(
@@ -118,65 +203,118 @@ def main():
         split=DATASET_SPLIT
     )
 
-    # Take a subset of the stream
     limited_dataset = dataset.take(N_EXAMPLES)
+    all_results = []
+    print(f"Running baseline evaluation on {N_EXAMPLES} samples...")
 
-    results = []
-    print(f"Running baseline evaluation on {N_EXAMPLES} examples...")
+    for i, example in enumerate(limited_dataset):
+        print("\n" + "=" * 80)
+        print(f"Processing Example {i + 1} / {N_EXAMPLES}")
+        print("=" * 80)
 
-    for i, example in enumerate(tqdm(limited_dataset, total=N_EXAMPLES)):
         query_id = example.get('query_id', i)
+
         try:
             query, real_answer, context = process_example(example)
-
-            if not query:
-                print(f"Skipping example {query_id}: missing query.")
+            if not query or not real_answer:
+                print(f"Skipping example {query_id}: missing query or real answer.")
                 continue
 
             # --- 1. Query-Only Baseline ---
-            # Format prompt for better QA
-            prompt_query_only = f"Question: {query}\nAnswer:"
+            messages_query_only = [
+                {"role": "system", "content": "You are a helpful assistant that answers questions."},
+                {"role": "user", "content": query}
+            ]
+            prompt_query_only = format_chat_prompt(tokenizer, messages_query_only)
             answer_query_only = generate_answer(model, tokenizer, prompt_query_only, device)
 
             # --- 2. RAG Baseline ---
-            # Use the exact prefix requested
-            prompt_rag = (
+            rag_user_prompt = (
                 f"{CONTEXT_PREFIX}{context}\n\n"
-                f"Question: {query}\nAnswer:"
+                f"Based on the document, please answer the following question:\n{query}"
             )
+            messages_rag = [
+                {"role": "system",
+                 "content": "You are a helpful assistant that answers questions based on the provided document."},
+                {"role": "user", "content": rag_user_prompt}
+            ]
+            prompt_rag = format_chat_prompt(tokenizer, messages_rag)
             answer_rag = generate_answer(model, tokenizer, prompt_rag, device)
 
-            # Store results
-            results.append({
+            # --- 3. Evaluation ---
+            bert_f1_query_only = get_bert_score(answer_query_only, real_answer, device)
+            bert_f1_rag = get_bert_score(answer_rag, real_answer, device)
+
+            relevancy_query_only = get_judge_score(judge_model, [(query, answer_query_only)])[0]
+            relevancy_rag = get_judge_score(judge_model, [(query, answer_rag)])[0]
+
+            faithfulness_query_only = 0.0  # Not applicable
+            faithfulness_rag = get_judge_score(judge_model, [(context, answer_rag)])[0]
+
+            # --- 4. Store results ---
+            result_item = {
                 "query_id": query_id,
                 "query": query,
                 "real_answer": real_answer,
                 "generated_answer_query_only": answer_query_only,
-                "generated_answer_rag": answer_rag
-            })
+                "bert_f1_query_only": bert_f1_query_only,
+                "relevancy_query_only": relevancy_query_only,
+                "generated_answer_rag": answer_rag,
+                "bert_f1_rag": bert_f1_rag,
+                "relevancy_rag": relevancy_rag,
+                "faithfulness_rag": faithfulness_rag
+            }
+            all_results.append(result_item)
 
-            # Optional: Print intermediate results for debugging
-            if i % 20 == 0 or i == N_EXAMPLES - 1:
-                print("\n---")
-                print(f"Example {i} (ID: {query_id})")
-                print(f"Query: {query}")
-                print(f"Real Answer: {real_answer}")
-                print(f"Answer (Query Only): {answer_query_only}")
-                print(f"Answer (RAG): {answer_rag}")
-                print("---")
+            # --- 5. Print detailed results for this item ---
+            print(f"QUERY: {query}")
+            print(f"GOLDEN ANSWER: {real_answer}\n")
+
+            print("--- (1) QUERY-ONLY RESULT ---")
+            print(f"Prediction: {answer_query_only}")
+            print(f" -> BERTScore (Correctness): {bert_f1_query_only:.4f}")
+            print(f" -> Relevancy (to Query):    {relevancy_query_only:.4f}\n")
+
+            print("--- (2) RAG RESULT ---")
+            print(f"Prediction: {answer_rag}")
+            print(f" -> BERTScore (Correctness): {bert_f1_rag:.4f}")
+            print(f" -> Relevancy (to Query):    {relevancy_rag:.4f}")
+            print(f" -> Faithfulness (to Doc): {faithfulness_rag:.4f}")
+
 
         except Exception as e:
-            print(f"Error processing example {query_id}: {e}")
+            print(f"CRITICAL Error processing example {query_id}: {e}")
             continue
 
-    # --- Save Results ---
-    print(f"\nEvaluation complete. Saving {len(results)} results to {OUTPUT_FILE}")
-    try:
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        print("Done.")
-    except Exception as e:
-        print(f"Error saving results to file: {e}")
+    # --- Save CSV Results ---
+    print("\n" + "=" * 80)
+
+    csv_results=[]
+    for item in all_results:
+        csv_results.append({
+            "query_id": item["query_id"],
+            "bert_f1_query_only": item["bert_f1_query_only"],
+            "bert_f1_rag": item["bert_f1_rag"],
+            "relevancy_rag": item["relevancy_rag"],
+            "faithfulness_rag": item["faithfulness_rag"]
+        })
+    save_results_csv(csv_results, OUTPUT_CSV_FILE)
+
+    # --- Print Average Scores ---
+    if all_results:
+        print("\n--- Average Scores ---")
+        avg_bert_f1_query = np.mean([r['bert_f1_query_only'] for r in all_results])
+        avg_bert_f1_rag = np.mean([r['bert_f1_rag'] for r in all_results])
+        avg_relevancy_query = np.mean([r['relevancy_query_only'] for r in all_results])
+        avg_relevancy_rag = np.mean([r['relevancy_rag'] for r in all_results])
+        avg_faithfulness_rag = np.mean([r['faithfulness_rag'] for r in all_results])
+
+        print(f"Query-Only | BERTScore F1: {avg_bert_f1_query:.4f} | Relevancy: {avg_relevancy_query:.4f}")
+        print(
+            f"RAG        | BERTScore F1: {avg_bert_f1_rag:.4f} | Relevancy: {avg_relevancy_rag:.4f} | Faithfulness: {avg_faithfulness_rag:.4f}")
+        print("------------------------")
+
+    print("Done.")
 
 
 if __name__ == "__main__":
