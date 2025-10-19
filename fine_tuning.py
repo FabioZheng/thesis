@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import subprocess
 import textwrap
 from dataclasses import dataclass
 from datetime import datetime
@@ -876,58 +877,106 @@ def compute_metrics(eval_pred, model):
     return metrics
 
 
-def main():
-    accelerator = Accelerator()
-    args = get_fine_tuning_args()
-
-    model_source = args.checkpoint_path if args.checkpoint_path else args.model_name_or_path
-    if model_source is None:
-        raise ValueError("Either --model_name_or_path or --checkpoint_path must be provided.")
-
+def build_cycle_config(model_source: str, args) -> COCOMConfig:
     cfg = COCOMConfig.from_pretrained(model_source)
-    lora = args.lora.lower() == "true"
-
     if args.compression_rates is not None:
         cfg.compr_rates = list(args.compression_rates)
-    compression_rates = list(cfg.compr_rates) if cfg.compr_rates is not None else []
-
     if args.compression_linear_type is not None:
         cfg.compr_linear_type = args.compression_linear_type
-
     cfg.generation_top_k = args.retriever_top_k
-    cfg.lora = lora
+    cfg.lora = args.lora.lower() == "true"
+    return cfg
 
-    compressor_model_name = cfg.compr_model_name or "decoder"
-    decoder_model_name = cfg.decoder_model_name
 
-    folder_name = f"{Hasher.hash(str(args))}"
-    tmp_output_dir = os.path.join(args.experiment_folder, "finetune_tmp")
-    model_output_dir = os.path.join(tmp_output_dir, "checkpoints")
-    final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
-    save_log_path = os.path.join(args.experiment_folder, "save_log.jsonl")
+def compute_cycle_offsets(args) -> List[int]:
+    if not getattr(args, "auto_continue_training", False):
+        return []
+    total_cycles = max(int(getattr(args, "auto_continue_cycles", 1)), 1)
+    initial_offset = int(getattr(args, "compress_initial_offset", 0))
+    increment = int(getattr(args, "compress_offset_increment", 100000))
+    return [initial_offset + idx * increment for idx in range(total_cycles)]
+
+
+def run_compress_command(args, offset: int, cycle_index: int, total_cycles: int) -> None:
+    script_path = getattr(args, "compress_script_path", "compress.py")
+    command: List[str] = ["python3", script_path]
+
+    hf_model_name = getattr(args, "compress_hf_model_name", None)
+    if hf_model_name:
+        command.extend(["--hf_model_name", hf_model_name])
+
+    limit = getattr(args, "compress_limit", None)
+    if limit is not None:
+        command.extend(["--limit", str(limit)])
+
+    context_batch_size = getattr(args, "compress_context_batch_size", None)
+    if context_batch_size is not None:
+        command.extend(["--context_batch_size", str(context_batch_size)])
+
+    if getattr(args, "compress_use_hf_dataset", True):
+        command.append("--use-hf-dataset")
+
+    dataset_name = getattr(args, "compress_hf_dataset_name", None)
+    if dataset_name:
+        command.extend(["--hf-dataset-name", dataset_name])
+
+    dataset_config = getattr(args, "compress_hf_dataset_config", None)
+    if dataset_config:
+        command.extend(["--hf-dataset-config", dataset_config])
+
+    dataset_split = getattr(args, "compress_hf_dataset_split", None)
+    if dataset_split:
+        command.extend(["--hf-dataset-split", dataset_split])
+
+    command.extend(["--hf-offset", str(offset)])
+
+    additional_args = getattr(args, "compress_additional_args", None)
+    if additional_args:
+        command.extend(additional_args)
+
+    env = os.environ.copy()
+    cuda_devices = getattr(args, "compress_cuda_devices", None)
+    if cuda_devices:
+        env["CUDA_VISIBLE_DEVICES"] = str(cuda_devices)
+
+    print(
+        f"Running compress.py for cycle {cycle_index + 1}/{total_cycles} with offset {offset}."
+    )
+    print("Compress command:", " ".join(command))
+    subprocess.run(command, check=True, env=env)
+
+
+def run_training_cycle(
+    accelerator: Accelerator,
+    args,
+    cfg: COCOMConfig,
+    model_source: str,
+    cycle_index: int,
+    total_cycles: int,
+    base_tmp_output_dir: str,
+    final_model_dir: str,
+    save_log_path: str,
+    offset: Optional[int],
+) -> None:
+    cycle_tmp_dir = os.path.join(base_tmp_output_dir, f"cycle_{cycle_index:02d}")
+    model_output_dir = os.path.join(cycle_tmp_dir, "checkpoints")
+    config_path = os.path.join(cycle_tmp_dir, "training_config.json")
 
     if accelerator.is_main_process:
-        run_name = (
-            f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
-            f"{lora}_{args.lr}_{folder_name}"
-        )
-        wandb.init(project="COCOM QA Finetune", name=run_name)
         os.makedirs(args.experiment_folder, exist_ok=True)
-        if os.path.exists(tmp_output_dir):
-            shutil.rmtree(tmp_output_dir)
-        if os.path.exists(final_model_dir):
-            shutil.rmtree(final_model_dir)
-        if os.path.exists(save_log_path):
-            os.remove(save_log_path)
+        if os.path.exists(cycle_tmp_dir):
+            shutil.rmtree(cycle_tmp_dir)
         os.makedirs(model_output_dir, exist_ok=True)
-        print(f"Temporary outputs: {tmp_output_dir}")
+        offset_display = offset if offset is not None else "N/A"
+        print(
+            f"Starting training cycle {cycle_index + 1}/{total_cycles} (offset={offset_display})"
+        )
+        print(f"Temporary outputs: {cycle_tmp_dir}")
         print(f"Final model path: {final_model_dir}")
         print(f"Checkpoint log path: {save_log_path}")
 
     accelerator.wait_for_everyone()
-
-    if not os.path.exists(model_output_dir):
-        os.makedirs(model_output_dir, exist_ok=True)
+    os.makedirs(model_output_dir, exist_ok=True)
 
     context_index = load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
@@ -966,10 +1015,7 @@ def main():
         top_k=args.retriever_top_k,
     )
 
-    if args.checkpoint_path:
-        model = COCOM.from_pretrained(args.checkpoint_path, config=cfg)
-    else:
-        model = COCOM.from_pretrained(args.model_name_or_path, config=cfg)
+    model = COCOM.from_pretrained(model_source, config=cfg)
     model.generation_top_k = args.retriever_top_k
 
     if accelerator.is_main_process:
@@ -998,7 +1044,7 @@ def main():
         save_strategy="no",
         report_to=None,
         warmup_ratio=args.warmup_ratio,
-        dataloader_num_workers=4,
+        dataloader_num_workers=16,
         do_eval=evaluation_strategy != "no",
         max_grad_norm=1.0,
         remove_unused_columns=False,
@@ -1007,9 +1053,11 @@ def main():
         num_train_epochs=epochs,
     )
 
-    accelerator = Accelerator()
-
-    world_size = max(accelerator.num_processes, 1)
+    accelerator_state = getattr(accelerator, "state", None)
+    world_size = getattr(accelerator_state, "num_processes", None)
+    if world_size is None:
+        world_size = getattr(accelerator, "num_processes", 1)
+    world_size = max(int(world_size), 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
     steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
     total_steps = steps_per_epoch * epochs
@@ -1062,9 +1110,8 @@ def main():
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
 
-    config_path = os.path.join(tmp_output_dir, "training_config.json")
     if accelerator.is_main_process:
-        os.makedirs(tmp_output_dir, exist_ok=True)
+        os.makedirs(cycle_tmp_dir, exist_ok=True)
         with open(config_path, "w") as json_file:
             json.dump(vars(args), json_file, indent=4)
 
@@ -1092,8 +1139,93 @@ def main():
 
     if accelerator.is_main_process:
         print(f"Saved fine-tuned model to: {final_model_dir}")
+        if os.path.exists(cycle_tmp_dir):
+            shutil.rmtree(cycle_tmp_dir)
+
+    accelerator.wait_for_everyone()
+
+
+def main():
+    args = get_fine_tuning_args()
+
+    model_source = args.checkpoint_path if args.checkpoint_path else args.model_name_or_path
+    if model_source is None:
+        raise ValueError("Either --model_name_or_path or --checkpoint_path must be provided.")
+
+    initial_cfg = build_cycle_config(model_source, args)
+    compression_rates = (
+        list(initial_cfg.compr_rates) if initial_cfg.compr_rates is not None else []
+    )
+
+    compressor_model_name = initial_cfg.compr_model_name or "decoder"
+    decoder_model_name = initial_cfg.decoder_model_name
+    lora_flag = args.lora.lower() == "true"
+
+    folder_name = f"{Hasher.hash(str(args))}"
+    tmp_output_dir = os.path.join(args.experiment_folder, "finetune_tmp")
+    final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
+    save_log_path = os.path.join(args.experiment_folder, "save_log.jsonl")
+
+    accelerator = Accelerator()
+
+    if accelerator.is_main_process:
+        run_name = (
+            f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
+            f"{lora_flag}_{args.lr}_{folder_name}"
+        )
+        wandb.init(project="COCOM QA Finetune", name=run_name)
+        os.makedirs(args.experiment_folder, exist_ok=True)
         if os.path.exists(tmp_output_dir):
             shutil.rmtree(tmp_output_dir)
+        if os.path.exists(final_model_dir):
+            checkpoint_path = getattr(args, "checkpoint_path", None)
+            if not checkpoint_path or (
+                os.path.abspath(checkpoint_path) != os.path.abspath(final_model_dir)
+            ):
+                shutil.rmtree(final_model_dir)
+        if os.path.exists(save_log_path):
+            os.remove(save_log_path)
+        print(f"Experiment folder: {args.experiment_folder}")
+        print(f"Final model path: {final_model_dir}")
+        print(f"Checkpoint log path: {save_log_path}")
+
+    accelerator.wait_for_everyone()
+
+    offsets = compute_cycle_offsets(args)
+    total_cycles = len(offsets) if offsets else 1
+
+    current_model_source = model_source
+    for cycle_index in range(total_cycles):
+        offset = offsets[cycle_index] if offsets else None
+        if offset is not None:
+            if accelerator.is_main_process:
+                run_compress_command(args, offset, cycle_index, total_cycles)
+            accelerator.wait_for_everyone()
+
+        cfg = build_cycle_config(current_model_source, args)
+        run_training_cycle(
+            accelerator=accelerator,
+            args=args,
+            cfg=cfg,
+            model_source=current_model_source,
+            cycle_index=cycle_index,
+            total_cycles=total_cycles,
+            base_tmp_output_dir=tmp_output_dir,
+            final_model_dir=final_model_dir,
+            save_log_path=save_log_path,
+            offset=offset,
+        )
+
+        current_model_source = final_model_dir
+
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        if os.path.exists(tmp_output_dir):
+            shutil.rmtree(tmp_output_dir)
+        print(f"Training complete. Latest model available at: {final_model_dir}")
+
+    if wandb.run is not None:
+        wandb.finish()
 
 
 if __name__ == "__main__":
