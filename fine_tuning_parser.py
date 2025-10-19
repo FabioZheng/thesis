@@ -89,4 +89,104 @@ def get_fine_tuning_args():
             "retrieved document ids and text snippets at every evaluation step."
         ),
     )
+    parser.add_argument(
+        "--auto_continue_training",
+        action="store_true",
+        help=(
+            "Automatically rerun compress.py between training cycles to stream additional "
+            "chunks from the dataset and resume fine-tuning from the latest checkpoint."
+        ),
+    )
+    parser.add_argument(
+        "--auto_continue_cycles",
+        type=int,
+        default=1,
+        help=(
+            "Total number of consecutive training cycles to run when auto continuation is "
+            "enabled. Each cycle consumes a new chunk of data produced by compress.py."
+        ),
+    )
+    parser.add_argument(
+        "--compress_script_path",
+        type=str,
+        default="compress.py",
+        help="Path to the compress.py entrypoint that should be invoked between cycles.",
+    )
+    parser.add_argument(
+        "--compress_hf_model_name",
+        type=str,
+        default="ielabgroup/tinyllama-compression-multi-rate-4-16-128",
+        help="Model identifier passed to compress.py via --hf_model_name.",
+    )
+    parser.add_argument(
+        "--compress_limit",
+        type=int,
+        default=10000,
+        help="Limit argument forwarded to compress.py (default mirrors manual command).",
+    )
+    parser.add_argument(
+        "--compress_context_batch_size",
+        type=int,
+        default=64,
+        help="Context batch size forwarded to compress.py.",
+    )
+    parser.add_argument(
+        "--compress_initial_offset",
+        type=int,
+        default=0,
+        help="Initial --hf-offset value supplied to compress.py when auto continuation runs.",
+    )
+    parser.add_argument(
+        "--compress_offset_increment",
+        type=int,
+        default=100000,
+        help="Offset increment applied between consecutive compress.py invocations.",
+    )
+    parser.add_argument(
+        "--compress_cuda_devices",
+        type=str,
+        default="0",
+        help="CUDA_VISIBLE_DEVICES value to set when invoking compress.py.",
+    )
+    parser.add_argument(
+        "--compress_hf_dataset_name",
+        type=str,
+        default=None,
+        help="Optional dataset name forwarded to compress.py via --hf-dataset-name.",
+    )
+    parser.add_argument(
+        "--compress_hf_dataset_config",
+        type=str,
+        default=None,
+        help="Optional dataset config forwarded to compress.py via --hf-dataset-config.",
+    )
+    parser.add_argument(
+        "--compress_hf_dataset_split",
+        type=str,
+        default=None,
+        help="Optional dataset split forwarded to compress.py via --hf-dataset-split.",
+    )
+    parser.add_argument(
+        "--compress_additional_args",
+        type=str,
+        nargs="*",
+        default=None,
+        help=(
+            "Additional raw arguments appended to the compress.py invocation. Provide each "
+            "flag or value as a separate token."
+        ),
+    )
+    parser.add_argument(
+        "--compress_use_hf_dataset",
+        dest="compress_use_hf_dataset",
+        action="store_true",
+        help="Pass --use-hf-dataset to compress.py when auto continuation is active.",
+    )
+    parser.add_argument(
+        "--compress_no_hf_dataset",
+        dest="compress_use_hf_dataset",
+        action="store_false",
+        help="Omit --use-hf-dataset when invoking compress.py.",
+    )
+    parser.set_defaults(compress_use_hf_dataset=True)
     return parser.parse_args()
