@@ -947,6 +947,7 @@ def run_compress_command(args, offset: int, cycle_index: int, total_cycles: int)
 
 
 def run_training_cycle(
+    accelerator: Accelerator,
     args,
     cfg: COCOMConfig,
     model_source: str,
@@ -957,7 +958,6 @@ def run_training_cycle(
     save_log_path: str,
     offset: Optional[int],
 ) -> None:
-    accelerator = Accelerator()
     cycle_tmp_dir = os.path.join(base_tmp_output_dir, f"cycle_{cycle_index:02d}")
     model_output_dir = os.path.join(cycle_tmp_dir, "checkpoints")
     config_path = os.path.join(cycle_tmp_dir, "training_config.json")
@@ -1053,7 +1053,11 @@ def run_training_cycle(
         num_train_epochs=epochs,
     )
 
-    world_size = max(accelerator.num_processes, 1)
+    accelerator_state = getattr(accelerator, "state", None)
+    world_size = getattr(accelerator_state, "num_processes", None)
+    if world_size is None:
+        world_size = getattr(accelerator, "num_processes", 1)
+    world_size = max(int(world_size), 1)
     total_batch_size = args.per_device_batch_size * world_size * args.gradient_accumulation
     steps_per_epoch = max(math.ceil(len(train_dataset) / total_batch_size), 1)
     total_steps = steps_per_epoch * epochs
@@ -1162,9 +1166,9 @@ def main():
     final_model_dir = os.path.join(args.experiment_folder, "fine_tuned_model")
     save_log_path = os.path.join(args.experiment_folder, "save_log.jsonl")
 
-    setup_accelerator = Accelerator()
+    accelerator = Accelerator()
 
-    if setup_accelerator.is_main_process:
+    if accelerator.is_main_process:
         run_name = (
             f"{compressor_model_name}_{decoder_model_name}_{compression_rates}_QA_"
             f"{lora_flag}_{args.lr}_{folder_name}"
@@ -1185,7 +1189,7 @@ def main():
         print(f"Final model path: {final_model_dir}")
         print(f"Checkpoint log path: {save_log_path}")
 
-    setup_accelerator.wait_for_everyone()
+    accelerator.wait_for_everyone()
 
     offsets = compute_cycle_offsets(args)
     total_cycles = len(offsets) if offsets else 1
@@ -1194,11 +1198,13 @@ def main():
     for cycle_index in range(total_cycles):
         offset = offsets[cycle_index] if offsets else None
         if offset is not None:
-            run_compress_command(args, offset, cycle_index, total_cycles)
-            setup_accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                run_compress_command(args, offset, cycle_index, total_cycles)
+            accelerator.wait_for_everyone()
 
         cfg = build_cycle_config(current_model_source, args)
         run_training_cycle(
+            accelerator=accelerator,
             args=args,
             cfg=cfg,
             model_source=current_model_source,
@@ -1212,8 +1218,8 @@ def main():
 
         current_model_source = final_model_dir
 
-    setup_accelerator.wait_for_everyone()
-    if setup_accelerator.is_main_process:
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
         if os.path.exists(tmp_output_dir):
             shutil.rmtree(tmp_output_dir)
         print(f"Training complete. Latest model available at: {final_model_dir}")
