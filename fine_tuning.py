@@ -70,25 +70,32 @@ class FaissRetriever:
     doc_id_to_index: Dict[str, int]
 
     def search(self, query_embedding: np.ndarray, k: int = 5) -> List[str]:
-        vector = np.asarray(query_embedding, dtype=np.float32)
-        if vector.ndim == 1:
-            vector = vector.reshape(1, -1).copy()
-        elif vector.ndim == 2:
-            if vector.shape[0] != 1:
-                vector = vector.reshape(1, -1).copy()
-            else:
-                vector = vector.copy()
-        else:
-            vector = vector.reshape(1, -1).copy()
-        faiss.normalize_L2(vector)
-        _scores, indices = self.index.search(vector, k)
-        doc_ids: List[str] = []
-        if indices.size:
-            for idx in indices[0]:
+        results = self.search_batch(query_embedding, k=k)
+        return results[0] if results else []
+
+    def search_batch(
+        self, query_embeddings: np.ndarray | Iterable[np.ndarray], k: int = 5
+    ) -> List[List[str]]:
+        vectors = np.asarray(query_embeddings, dtype=np.float32)
+        if vectors.ndim == 1:
+            vectors = vectors.reshape(1, -1)
+        elif vectors.ndim > 2:
+            vectors = vectors.reshape(vectors.shape[0], -1)
+        vectors = np.ascontiguousarray(vectors)
+
+        faiss.normalize_L2(vectors)
+        _scores, indices = self.index.search(vectors, k)
+
+        batch_doc_ids: List[List[str]] = []
+        for row in indices:
+            doc_ids: List[str] = []
+            for idx in row:
                 if idx < 0 or idx >= len(self.index_to_doc_id):
                     continue
                 doc_ids.append(self.index_to_doc_id[idx])
-        return doc_ids
+            batch_doc_ids.append(doc_ids)
+
+        return batch_doc_ids
 
 
 def load_retriever(embeddings_path: str, docs_path: Optional[str]) -> FaissRetriever:
@@ -488,6 +495,39 @@ class RAGFineTuneDataset(Dataset):
         skipped_due_to_contexts = 0
         skipped_due_to_embeddings = 0
         mismatched_query_ids: set[str] = set()
+        batch_examples: List[Dict[str, object]] = []
+        batch_vectors: List[np.ndarray] = []
+        batch_size = get_fine_tuning_args().faiss_batch_size
+
+        def process_batch() -> None:
+            nonlocal batch_examples, batch_vectors, skipped_due_to_contexts
+            if not batch_examples:
+                return
+
+            vectors = np.asarray(batch_vectors, dtype=np.float32)
+            retrieved_batches = retriever.search_batch(vectors, k=top_k)
+
+            for example_info, retrieved_doc_ids in zip(batch_examples, retrieved_batches):
+                doc_ids: List[str] = []
+                for doc_id in retrieved_doc_ids:
+                    key = _to_str_doc_id(doc_id)
+                    if key in self.doc_id_to_index:
+                        doc_ids.append(key)
+                if len(doc_ids) < top_k:
+                    skipped_due_to_contexts += 1
+                    continue
+                self.samples.append(
+                    {
+                        "query_id": example_info["query_id"],
+                        "question": example_info["question"],
+                        "answer": example_info["answer"],
+                        "doc_ids": doc_ids[:top_k],
+                    }
+                )
+
+            batch_examples = []
+            batch_vectors = []
+
         for example in tqdm(qa_split, desc="Preparing RAG QA split"):
             question = example.get("question") or example.get("query") or ""
             if not question:
@@ -511,21 +551,19 @@ class RAGFineTuneDataset(Dataset):
                     )
                     mismatched_query_ids.add(query_id)
 
-            retrieved_doc_ids = retriever.search(vector, k=top_k)
-            doc_ids: List[str] = []
-            for doc_id in retrieved_doc_ids:
-                key = _to_str_doc_id(doc_id)
-                if key in self.doc_id_to_index:
-                    doc_ids.append(key)
-            if len(doc_ids) < top_k:
-                skipped_due_to_contexts += 1
-                continue
-            self.samples.append({
-                "query_id": query_id,
-                "question": question,
-                "answer": answer,
-                "doc_ids": doc_ids[:top_k],
-            })
+            batch_examples.append(
+                {
+                    "query_id": query_id,
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+            batch_vectors.append(vector)
+
+            if len(batch_examples) >= batch_size:
+                process_batch()
+
+        process_batch()
 
         retained = len(self.samples)
         if retained == 0:

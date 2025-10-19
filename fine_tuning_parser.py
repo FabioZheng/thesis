@@ -79,6 +79,7 @@ def get_fine_tuning_args():
         default="cuda" if torch.cuda.is_available() else "cpu",
     )
     parser.add_argument("--retriever_top_k", type=int, default=5)
+    parser.add_argument("--faiss_batch_size", type=int, default=64)
     parser.add_argument("--decoder_max_length", type=int, default=256)
     parser.add_argument(
         "--show_retrieval_preview",
