@@ -198,7 +198,9 @@ def generate_text(model: COCOM, prompt: str, max_new_tokens: int, device: str) -
         do_sample=False,
         max_new_tokens=max_new_tokens,
     )
-    text = model.decoder_tokenizer.decode(output[0], skip_special_tokens=True)
+    prompt_length = encoded["input_ids"].shape[-1]
+    generated_tokens = output[0, prompt_length:]
+    text = model.decoder_tokenizer.decode(generated_tokens, skip_special_tokens=True)
     return text.strip()
 
 
