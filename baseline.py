@@ -3,7 +3,7 @@
 import json
 import torch
 from datasets import load_dataset
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 import csv
 import numpy as np
 import argparse  # New import for command-line arguments
@@ -21,7 +21,7 @@ except ImportError:
     exit(1)
 
 # --- Configuration ---
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL_REPO = "ielabgroup/tinyllama-compression-multi-rate-4-16-128"
 JUDGE_MODEL_NAME = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
 
 DATASET_NAME = "ms_marco"
@@ -38,26 +38,54 @@ OUTPUT_CSV_FILE = "baseline_evaluation_results.csv"
 
 # --- Helper Functions ---
 
-def load_model_and_tokenizer(model_name):
-    """Loads the TinyLlama model and tokenizer."""
-    print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+def load_model_and_tokenizer(model_repo):
+    """Loads the CoCoM model and returns its decoder and tokenizer."""
+    print(f"Loading CoCoM model: {model_repo}")
+    cocom_model = AutoModelForCausalLM.from_pretrained(
+        model_repo,
+        trust_remote_code=True,
+        torch_dtype=torch.float16,
+        device_map="auto"
+    )
+
+    decoder = getattr(cocom_model, "decoder", None)
+    tokenizer = getattr(cocom_model, "decoder_tokenizer", None)
+
+    if decoder is None or tokenizer is None:
+        raise ValueError(
+            "Loaded CoCoM model does not expose the decoder and tokenizer."
+        )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
-    print(f"Loading generation model: {model_name}")
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float16,
-        device_map="auto"
-    )
-    model.eval()
-    device = model.device
-    print(f"Generation model loaded on device: {device}")
+    decoder.eval()
 
-    return model, tokenizer, device
+    device = None
+    try:
+        device = next(decoder.parameters()).device
+    except StopIteration:
+        device = None
+
+    if (device is None or device.type == 'meta') and hasattr(decoder, "hf_device_map"):
+        first_device = next(iter(decoder.hf_device_map.values()))
+        if isinstance(first_device, str):
+            device = torch.device(first_device)
+        elif isinstance(first_device, int):
+            device = torch.device(f"cuda:{first_device}") if torch.cuda.is_available() else torch.device('cpu')
+        elif isinstance(first_device, torch.device):
+            device = first_device
+
+    if device is None or device.type == 'meta':
+        device = torch.device('cpu')
+
+    print(f"Decoder loaded on device: {device}")
+
+    # Keep a reference to the parent CoCoM model to avoid it being garbage collected.
+    decoder._cocom_parent = cocom_model
+
+    return decoder, tokenizer, device
 
 
 def load_judge_model(model_name, device):
@@ -192,7 +220,7 @@ def main():
     N_EXAMPLES = args.num_samples
     # --- End of new argument parsing ---
 
-    model, tokenizer, device = load_model_and_tokenizer(MODEL_NAME)
+    model, tokenizer, device = load_model_and_tokenizer(MODEL_REPO)
     judge_model = load_judge_model(JUDGE_MODEL_NAME, device)
 
     print(f"\nLoading and streaming dataset: {DATASET_NAME} ({DATASET_CONFIG})")
