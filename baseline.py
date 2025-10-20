@@ -48,13 +48,11 @@ def load_model_and_tokenizer(model_repo):
         device_map="auto"
     )
 
-    decoder = getattr(cocom_model, "decoder", None)
-    tokenizer = getattr(cocom_model, "decoder_tokenizer", None)
+    if not hasattr(cocom_model, "decoder") or not hasattr(cocom_model, "decoder_tokenizer"):
+        raise ValueError("Loaded CoCoM model is missing the decoder components")
 
-    if decoder is None or tokenizer is None:
-        raise ValueError(
-            "Loaded CoCoM model does not expose the decoder and tokenizer."
-        )
+    decoder = cocom_model.decoder
+    tokenizer = cocom_model.decoder_tokenizer
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
