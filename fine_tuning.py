@@ -1043,7 +1043,8 @@ def run_training_cycle(
     final_model_dir: str,
     save_log_path: str,
     offset: Optional[int],
-) -> None:
+    current_learning_rate: Optional[float],
+) -> float:
     cycle_tmp_dir = os.path.join(base_tmp_output_dir, f"cycle_{cycle_index:02d}")
     model_output_dir = os.path.join(cycle_tmp_dir, "checkpoints")
     config_path = os.path.join(cycle_tmp_dir, "training_config.json")
@@ -1119,9 +1120,11 @@ def run_training_cycle(
 
     epochs = max(args.epochs, 1)
 
+    learning_rate = args.lr if current_learning_rate is None else current_learning_rate
+
     training_args = TrainingArguments(
         output_dir=model_output_dir,
-        learning_rate=args.lr,
+        learning_rate=learning_rate,
         eval_accumulation_steps=args.gradient_accumulation,
         per_device_train_batch_size=args.per_device_batch_size,
         per_device_eval_batch_size=max(args.per_device_batch_size // 4, 1),
@@ -1213,6 +1216,10 @@ def run_training_cycle(
 
     trainer.train(resume_from_checkpoint=checkpoint)
 
+    final_learning_rate = learning_rate
+    if trainer.optimizer is not None and trainer.optimizer.param_groups:
+        final_learning_rate = float(trainer.optimizer.param_groups[0].get("lr", learning_rate))
+
     overwrite_and_log_model(
         accelerator=accelerator,
         model=model,
@@ -1229,6 +1236,8 @@ def run_training_cycle(
             shutil.rmtree(cycle_tmp_dir)
 
     accelerator.wait_for_everyone()
+
+    return final_learning_rate
 
 
 def main():
@@ -1281,6 +1290,7 @@ def main():
     total_cycles = len(offsets) if offsets else 1
 
     current_model_source = model_source
+    current_learning_rate = args.lr
     for cycle_index in range(total_cycles):
         offset = offsets[cycle_index] if offsets else None
         if offset is not None:
@@ -1289,7 +1299,7 @@ def main():
             accelerator.wait_for_everyone()
 
         cfg = build_cycle_config(current_model_source, args)
-        run_training_cycle(
+        current_learning_rate = run_training_cycle(
             accelerator=accelerator,
             args=args,
             cfg=cfg,
@@ -1300,6 +1310,7 @@ def main():
             final_model_dir=final_model_dir,
             save_log_path=save_log_path,
             offset=offset,
+            current_learning_rate=current_learning_rate,
         )
 
         current_model_source = final_model_dir
