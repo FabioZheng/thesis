@@ -21,7 +21,8 @@ except ImportError:
     exit(1)
 
 # --- Configuration ---
-MODEL_NAME = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+MODEL_REPO = "ielabgroup/tinyllama-compression-multi-rate-4-16-128"
+MODEL_DECODER_SUBFOLDER = "decoder"
 JUDGE_MODEL_NAME = 'cross-encoder/ms-marco-MiniLM-L-6-v2'
 
 DATASET_NAME = "ms_marco"
@@ -38,20 +39,26 @@ OUTPUT_CSV_FILE = "baseline_evaluation_results.csv"
 
 # --- Helper Functions ---
 
-def load_model_and_tokenizer(model_name):
-    """Loads the TinyLlama model and tokenizer."""
-    print(f"Loading tokenizer: {model_name}")
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+def load_model_and_tokenizer(model_repo):
+    """Loads the decoder from the compression model and its tokenizer."""
+    print(f"Loading tokenizer from decoder: {model_repo}")
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_repo,
+        subfolder=MODEL_DECODER_SUBFOLDER,
+        trust_remote_code=True
+    )
 
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = 'left'
 
-    print(f"Loading generation model: {model_name}")
+    print(f"Loading decoder model: {model_repo}")
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        model_repo,
+        subfolder=MODEL_DECODER_SUBFOLDER,
         torch_dtype=torch.float16,
-        device_map="auto"
+        device_map="auto",
+        trust_remote_code=True
     )
     model.eval()
     device = model.device
@@ -192,7 +199,7 @@ def main():
     N_EXAMPLES = args.num_samples
     # --- End of new argument parsing ---
 
-    model, tokenizer, device = load_model_and_tokenizer(MODEL_NAME)
+    model, tokenizer, device = load_model_and_tokenizer(MODEL_REPO)
     judge_model = load_judge_model(JUDGE_MODEL_NAME, device)
 
     print(f"\nLoading and streaming dataset: {DATASET_NAME} ({DATASET_CONFIG})")
