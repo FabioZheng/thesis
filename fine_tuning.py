@@ -514,14 +514,17 @@ class RAGFineTuneDataset(Dataset):
                     if key in self.doc_id_to_index:
                         doc_ids.append(key)
                 if len(doc_ids) < top_k:
-                    skipped_due_to_contexts += 1
-                    continue
+                    # --- FIX: We can relax this. We don't need all top_k docs.
+                    # We can proceed even with 1 doc.
+                    if len(doc_ids) == 0:
+                        skipped_due_to_contexts += 1
+                        continue
                 self.samples.append(
                     {
                         "query_id": example_info["query_id"],
                         "question": example_info["question"],
                         "answer": example_info["answer"],
-                        "doc_ids": doc_ids[:top_k],
+                        "doc_ids": doc_ids[:top_k],  # Keep all retrieved docs up to top_k
                     }
                 )
 
@@ -611,101 +614,107 @@ class RAGFineTuneDataset(Dataset):
         if not context_tensors:
             raise ValueError("Missing context tensors for retrieved document ids.")
 
-
-        max_mem = max(tensor.size(0) for tensor in context_tensors)
-        hidden = context_tensors[0].size(1)
-        padded_contexts = []
-        for tensor in context_tensors:
-            if tensor.size(0) < max_mem:
-                pad = torch.zeros((max_mem - tensor.size(0), hidden), dtype=tensor.dtype)
-                tensor = torch.cat([tensor, pad], dim=0)
-            padded_contexts.append(tensor)
-        stacked = torch.stack(padded_contexts, dim=0)
+        # --- FIX: REMOVED PADDING BLOCK ---
+        # We no longer pad the context_tensors to be the same length.
+        # We return a list of tensors with variable lengths.
+        #
+        # --- OLD CODE DELETED ---
+        # max_mem = max(tensor.size(0) for tensor in context_tensors)
+        # hidden = context_tensors[0].size(1)
+        # padded_contexts = []
+        # ... (padding loop) ...
+        # stacked = torch.stack(padded_contexts, dim=0)
+        # --- END OLD CODE ---
 
         return {
             "question": question,
             "answer": answer,
-            "context_embeddings": stacked,
+            "context_embeddings": context_tensors,  # --- FIX: This is now a List[Tensor] ---
         }
 
 
 @dataclass
 class RAGDataCollator:
     tokenizer: any
-    top_k: int
+    top_k: int  # This is now the *max* top_k, not a fixed number
     decoder_max_length: int
 
     def __call__(self, features: List[Dict[str, object]]) -> Dict[str, torch.Tensor]:
-        context_embeddings = [feature["context_embeddings"] for feature in features]
+        # --- FIX: START OF REWRITTEN __call__ METHOD ---
+        # This function is rewritten to handle "ragged" batches of embeddings
+        # where each document can have a different length (different # of MEM tokens).
+
         questions = [feature["question"] for feature in features]
         answers = [feature["answer"] for feature in features]
+        # context_embeddings is now a List[List[torch.Tensor]]
+        # e.g., batch[0] = [tensor(4,H), tensor(16,H), tensor(8,H)]
+        context_embeddings = [feature["context_embeddings"] for feature in features]
 
-        top_k = context_embeddings[0].size(0)
-        if top_k != self.top_k:
-            raise ValueError(
-                f"Batch contexts use {top_k} documents but collator was initialised for {self.top_k}."
-            )
-        if any(tensor.size(0) != top_k for tensor in context_embeddings):
-            raise ValueError("All samples must have the same number of retrieved contexts.")
-
-        hidden = context_embeddings[0].size(2)
         bos = self.tokenizer.bos_token or ""
         mem_token_symbol = getattr(self.tokenizer, "mem_token", "") or ""
+        sep_token_symbol = getattr(self.tokenizer, "sep_token", "") or ""  # --- FIX: Get SEP token
+        if not mem_token_symbol:
+            raise ValueError("Tokenizer is missing 'mem_token'")
+        if not sep_token_symbol:
+            tqdm.write("Warning: Tokenizer is missing 'sep_token'. Document contexts will not be separated.")
 
-        trimmed_contexts: List[torch.Tensor] = []
-        mem_per_context: List[int] = []
-        for tensor, question in zip(context_embeddings, questions):
-            sample_max_mem = tensor.size(1)
+        prompts = []
+        flat_context_tensors = []
+        # indices tensor tracks which docs belong to which batch item
+        # indices[i] -> start doc index, indices[i+1] -> end doc index
+        indices = [0]
+
+        for i in range(len(features)):
+            question = questions[i]
+            sample_tensors = context_embeddings[i]  # List[Tensor] for this sample
+
+            # Calculate available token space, leaving room for question text
             base_prompt = f"{bos}[INST]{question}\n[/INST]\n"
-            base_encoding = self.tokenizer(
-                base_prompt,
-                add_special_tokens=False,
-                return_attention_mask=False,
-                padding=False,
-                truncation=False,
-            )
-            base_ids = base_encoding.get("input_ids", [])
-            if base_ids and isinstance(base_ids[0], list):
-                base_ids = base_ids[0]
-            base_len = len(base_ids)
-            available_mem_tokens = max(0, self.decoder_max_length - base_len)
-            mem_tokens_per_context = min(sample_max_mem, available_mem_tokens // top_k)
+            # Tokenize *without* special tokens to get true length
+            base_len = len(self.tokenizer(base_prompt, add_special_tokens=False)['input_ids'])
+            available_space = self.decoder_max_length - base_len
 
-            trimmed = tensor[:, :mem_tokens_per_context, :]
-            trimmed_contexts.append(trimmed)
-            mem_per_context.append(mem_tokens_per_context)
+            mem_blocks_for_sample = []
+            tensors_to_use = []
+            current_space_used = 0
+            sep_len = len(self.tokenizer(sep_token_symbol, add_special_tokens=False)['input_ids'])
 
-        max_effective_mem = max(mem_per_context) if mem_per_context else 0
+            for tensor in sample_tensors:
+                mem_len = tensor.size(0)  # The number of <MEM> tokens
 
-        padded_contexts: List[torch.Tensor] = []
-        for tensor, effective_mem in zip(trimmed_contexts, mem_per_context):
-            if effective_mem < max_effective_mem:
-                pad = torch.zeros(
-                    (top_k, max_effective_mem - effective_mem, hidden),
-                    dtype=tensor.dtype,
-                    device=tensor.device,
-                )
-                tensor = torch.cat([tensor, pad], dim=1)
-            padded_contexts.append(tensor)
-        context_batch = torch.stack(padded_contexts, dim=0)
+                # Check if this document (MEM tokens + SEP token) fits
+                if current_space_used + mem_len + sep_len <= available_space:
+                    # --- FIX: Add MEM block AND SEP token ---
+                    mem_blocks_for_sample.append((mem_token_symbol * mem_len) + sep_token_symbol)
+                    tensors_to_use.append(tensor)
+                    current_space_used += mem_len + sep_len
+                else:
+                    # Stop adding docs if we run out of context space
+                    break
 
-        prompts: List[str] = []
-        for question, mem_count in zip(questions, mem_per_context):
-            mem_tokens = mem_token_symbol * mem_count if mem_count > 0 else ""
-            mem_block = mem_tokens * top_k
-            prompts.append(f"{bos}{mem_block}[INST]{question}\n[/INST]\n")
+            # Create the final prompt string for this sample
+            mem_block_str = "".join(mem_blocks_for_sample)
+            prompts.append(f"{bos}{mem_block_str}[INST]{question}\n[/INST]\n")
 
+            # Add this sample's tensors to the flat batch list
+            flat_context_tensors.extend(tensors_to_use)
+            # Record the end index for this sample
+            indices.append(len(flat_context_tensors))
+
+        # Tokenize all prompt strings (text part)
         dec_inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
             padding="max_length",
             max_length=self.decoder_max_length,
             truncation=True,
-            add_special_tokens=False,
+            add_special_tokens=False,  # We already added BOS manually
         )
 
+        # --- FIX: Tokenize labels, adding EOS token for consistency ---
+        answers_with_eos = [ans + (self.tokenizer.eos_token or "") for ans in answers]
         labels = self.tokenizer(
-            answers,
+            answers_with_eos,
             return_tensors="pt",
             padding="max_length",
             max_length=self.decoder_max_length,
@@ -714,13 +723,43 @@ class RAGDataCollator:
         )["input_ids"]
         labels[labels == self.tokenizer.pad_token_id] = -100
 
+        # --- FIX: Pad the flat list of context tensors ---
+        # We now have a flat list of tensors (e.g., 8 docs for a batch of 2)
+        # We must pad them all to the *longest* tensor *in this flat list*
+
+        # Get lengths of all tensors in the flat batch
+        context_lengths = torch.tensor([t.size(0) for t in flat_context_tensors], dtype=torch.long)
+
+        if flat_context_tensors:
+            max_len_in_batch = context_lengths.max().item()
+            hidden_size = flat_context_tensors[0].size(1)
+
+            padded_batch_tensors = []
+            for tensor in flat_context_tensors:
+                pad_len = max_len_in_batch - tensor.size(0)
+                if pad_len > 0:
+                    pad = torch.zeros((pad_len, hidden_size), dtype=tensor.dtype, device=tensor.device)
+                    padded_batch_tensors.append(torch.cat([tensor, pad], dim=0))
+                else:
+                    padded_batch_tensors.append(tensor)
+
+            context_batch = torch.stack(padded_batch_tensors, dim=0)
+        else:
+            # Handle empty batch case
+            context_batch = torch.empty(0, 0, 0, dtype=torch.float32)
+            max_len_in_batch = 0
+            hidden_size = 0
+
         batch = {
             "dec_input_ids": dec_inputs["input_ids"],
             "dec_attention_mask": dec_inputs["attention_mask"],
             "labels": labels,
-            "context_embeddings": context_batch,
+            "context_embeddings": context_batch,  # Shape (TotalDocs, MaxMem, H)
+            "context_indices": torch.tensor(indices, dtype=torch.long),  # Shape (BatchSize + 1)
+            "context_lengths": context_lengths,  # Shape (TotalDocs)
         }
         return batch
+        # --- FIX: END OF REWRITTEN __call__ METHOD ---
 
 
 class FineTuningTrainer(Trainer):
@@ -756,12 +795,21 @@ class FineTuningTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         context_embeddings = inputs.get("context_embeddings")
         if context_embeddings is not None:
-            outputs = model.module.forward_with_context_embeddings(
+
+            # --- FIX: Pass new tensors to the model ---
+            # Handle DataParallel/DistributedDataParallel
+            model_to_call = model.module if hasattr(model, "module") else model
+
+            outputs = model_to_call.forward_with_context_embeddings(
                 context_embeddings=context_embeddings,
+                context_indices=inputs["context_indices"],  # --- FIX: Pass new tensor
+                context_lengths=inputs["context_lengths"],  # --- FIX: Pass new tensor
                 dec_input_ids=inputs["dec_input_ids"],
                 dec_attention_mask=inputs["dec_attention_mask"],
                 labels=inputs.get("labels"),
             )
+            # --- END FIX ---
+
         else:
             outputs = model(**inputs)
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs
@@ -778,14 +826,14 @@ class FineTuningTrainer(Trainer):
 
 class RetrievalPreviewCallback(TrainerCallback):
     def __init__(
-        self,
-        accelerator: Accelerator,
-        split_name: str,
-        examples: List[Dict[str, object]],
-        retriever: FaissRetriever,
-        query_vectors: Dict[str, np.ndarray],
-        docs_lookup: Dict[str, str],
-        top_k: int,
+            self,
+            accelerator: Accelerator,
+            split_name: str,
+            examples: List[Dict[str, object]],
+            retriever: FaissRetriever,
+            query_vectors: Dict[str, np.ndarray],
+            docs_lookup: Dict[str, str],
+            top_k: int,
     ) -> None:
         self.accelerator = accelerator
         self.split_name = split_name

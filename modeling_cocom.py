@@ -158,7 +158,6 @@ class COCOM(PreTrainedModel):
             # case decoder based compressor
             print("Using decoder-based compressor")
             self.compr = None
-
         # set lora adaptors
         if cfg.lora:
             peft_config = LoraConfig(
@@ -194,7 +193,7 @@ class COCOM(PreTrainedModel):
             self.decoder_tokenizer.pad_token_id = self.decoder_tokenizer.bos_token_id
 
         # resize the tokenizer embedding
-        self.decoder.resize_token_embeddings(len(self.decoder_tokenizer))
+        self.decoder.resize_token_embeddings(len(self.decoder_tokenizer), mean_resizing=False)
         self.decoder.generation_config.top_p = None
         self.decoder.generation_config.temperature = None
         self.compr_model_name = cfg.compr_model_name
@@ -246,11 +245,16 @@ class COCOM(PreTrainedModel):
         mask = input_ids == self.decoder_tokenizer.mem_token_id
         return emb[mask].reshape(emb.size(0), -1, emb.size(-1))
 
-    def replace_embeddings(self, compressed_embs, dec_input_ids, indices):
+    def replace_embeddings(self, compressed_embs, dec_input_ids, indices, compressed_embs_lengths=None):
         # Embed the decoder input
         inputs_embeds = self.decoder.get_input_embeddings()(dec_input_ids)
         mem_token_mask = dec_input_ids == self.decoder_tokenizer.mem_token_id
         batch_size = inputs_embeds.size(0)
+
+        use_lengths = compressed_embs_lengths is not None
+        if use_lengths and compressed_embs_lengths.numel() != compressed_embs.size(0):
+            raise ValueError(
+                f"Mismatch between compressed_embs ({compressed_embs.size(0)}) and compressed_embs_lengths ({compressed_embs_lengths.numel()})")
 
         for i in range(batch_size):
             mem_positions = torch.where(mem_token_mask[i])[0]
@@ -258,23 +262,38 @@ class COCOM(PreTrainedModel):
                 continue
 
             ptr = 0
-            for local_idx, j in enumerate(range(indices[i], indices[i + 1])):
-                current_embs = compressed_embs[j]
+            # Use the new indices to find the docs for this sample
+            start_doc_idx = indices[i].item()
+            end_doc_idx = indices[i + 1].item()
+
+            for j in range(start_doc_idx, end_doc_idx):
+                current_embs_padded = compressed_embs[j]  # This is (max_mem, H)
+
+                if use_lengths:
+                    original_len = compressed_embs_lengths[j].item()
+                    current_embs = current_embs_padded[:original_len]  # Slice to real length
+                    required = original_len
+                else:
+                    current_embs = current_embs_padded
+                    required = current_embs.size(0)  # Use the full padded length
+
                 if current_embs.dtype != inputs_embeds.dtype:
                     current_embs = current_embs.to(dtype=inputs_embeds.dtype)
-                required = current_embs.size(0)
-                remaining = mem_positions.numel() - ptr
 
+                remaining = mem_positions.numel() - ptr
                 if remaining <= 0:
-                    break
+                    break  # No more <MEM> tokens in prompt
 
                 use = min(required, remaining)
+                if use == 0:
+                    continue  # No space left in prompt or doc was length 0
+
                 target_positions = mem_positions[ptr:ptr + use]
                 inputs_embeds[i, target_positions, :] = current_embs[:use]
                 ptr += use
 
-                if use < required:
-                    break
+                # Note: If use < required, the embedding is truncated by the
+                # <MEM> block size in the prompt, which is expected.
 
         return inputs_embeds
 
@@ -319,24 +338,29 @@ class COCOM(PreTrainedModel):
         return {"loss": avg_loss, "logits": all_logits}  # Returns average loss and list of logits
 
     def forward_with_context_embeddings(
-        self,
-        context_embeddings: torch.Tensor,
-        dec_input_ids: torch.LongTensor,
-        dec_attention_mask: torch.LongTensor,
-        labels: Optional[torch.LongTensor] = None,
+            self,
+            context_embeddings: torch.Tensor,  # Now (TotalDocs, MaxMem, H)
+            context_indices: torch.LongTensor,  # New: (BatchSize + 1,)
+            context_lengths: torch.LongTensor,  # New: (TotalDocs,)
+            dec_input_ids: torch.LongTensor,
+            dec_attention_mask: torch.LongTensor,
+            labels: Optional[torch.LongTensor] = None,
     ) -> Dict[str, torch.Tensor]:
-        if context_embeddings.dim() == 3:
-            context_embeddings = context_embeddings.unsqueeze(0)
-        if context_embeddings.dim() != 4:
-            raise ValueError("context_embeddings must have shape (batch, top_k, mem, hidden)")
 
-        batch_size, top_k, mem_tokens, hidden = context_embeddings.size()
-        flattened = context_embeddings.reshape(batch_size * top_k, mem_tokens, hidden)
-        self.generation_top_k = top_k
+        # The old logic to flatten/reshape is no longer needed,
+        # context_embeddings is already the flat (TotalDocs, MaxMem, H) tensor.
+        # We also don't need to read self.generation_top_k here.
 
-        indices = range(0, flattened.size(0) + 1, top_k)
-        compressed_embs = flattened.to(dec_input_ids.device)
-        inputs_embeds = self.replace_embeddings(compressed_embs, dec_input_ids, indices)
+        if context_embeddings.dim() != 3:
+            raise ValueError(
+                f"context_embeddings must have shape (TotalDocs, MaxMem, Hidden), but got {context_embeddings.shape}")
+
+        inputs_embeds = self.replace_embeddings(
+            compressed_embs=context_embeddings.to(dec_input_ids.device),
+            compressed_embs_lengths=context_lengths.to(dec_input_ids.device),  # Pass new lengths
+            dec_input_ids=dec_input_ids,
+            indices=context_indices.to(dec_input_ids.device)  # Pass new indices
+        )
 
         decoder_outputs = self.decoder(
             inputs_embeds=inputs_embeds,
