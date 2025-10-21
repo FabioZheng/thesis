@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 from transformers import Trainer, TrainingArguments, TrainerCallback
 from fine_tuning_parser import get_fine_tuning_args
 from datasets.fingerprint import Hasher
-from metrics import exact_match_score, f1_score
+from metrics import compute_bertscore, f1_score
 from modeling_cocom import COCOM, COCOMConfig
 from transformers.trainer_utils import get_last_checkpoint
 
@@ -949,9 +949,9 @@ def compute_metrics(eval_pred, model):
     labels_str = original_model.decoder_tokenizer.batch_decode(labels, skip_special_tokens=True)
 
     metrics = {}
-    em = exact_match_score(preds_str, labels_str)
+    bert_score = compute_bertscore(preds_str, labels_str)
     f1 = f1_score(preds_str, labels_str)
-    metrics.update({"EM": em, "F1": f1})
+    metrics.update({"BERTScore": bert_score, "F1": f1})
 
     sample_pairs = list(zip(preds_str, labels_str))
     if sample_pairs:
