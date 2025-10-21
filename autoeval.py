@@ -55,9 +55,6 @@ class EvaluationConfig:
 
 @dataclass
 class ExampleResult:
-    doc_id: Optional[str]
-    text: str
-    reconstruction: str
     compression_rate: int
     tokens_in: int
     tokens_out: int
@@ -120,14 +117,10 @@ def parse_args() -> EvaluationConfig:
 
 
 def load_dataset_records(dataset_name: str, split: str, max_samples: Optional[int]) -> List[Dict[str, str]]:
-    dataset = hf_load_dataset(dataset_name, split=split)
-
-    if max_samples is not None:
-        max_samples = min(max_samples, len(dataset))
-        dataset = dataset.select(range(max_samples))
+    dataset_iter = hf_load_dataset(dataset_name, split=split, streaming=True)
 
     records: List[Dict[str, str]] = []
-    for example in dataset:
+    for example in dataset_iter:
         text = example.get("text")
         if text is None:
             continue
@@ -138,6 +131,9 @@ def load_dataset_records(dataset_name: str, split: str, max_samples: Optional[in
                 record["id"] = str(example[candidate])
                 break
         records.append(record)
+
+        if max_samples is not None and len(records) >= max_samples:
+            break
 
     return records
 
@@ -337,52 +333,45 @@ def evaluate_model(
     references: List[str] = []
     predictions: List[str] = []
 
-    with log_path.open("w", encoding="utf-8") as log_file:
-        for example in tqdm(dataset, desc=f"Evaluating {name}"):
-            text = example["text"]
-            doc_id = example.get("id")
+    error_count = 0
 
-            if default_rate is not None:
-                rate = default_rate
-            else:
-                # For the adaptive model, the rate is determined per example
-                rate = int(getattr(model, "current_rate", 4))
+    for example in tqdm(dataset, desc=f"Evaluating {name}"):
+        text = example["text"]
 
-            try:
-                decoded, tokens_out, encode_time, decode_time = autoencode_example(
-                    model, text, rate, device, agent=agent
-                )
-            except Exception as exc:  # pragma: no cover - best effort logging
-                error_record = {
-                    "id": doc_id,
-                    "text": text,
-                    "error": str(exc),
-                }
-                log_file.write(json.dumps(error_record) + "\n")
-                continue
+        if default_rate is not None:
+            rate = default_rate
+        else:
+            # For the adaptive model, the rate is determined per example
+            rate = int(getattr(model, "current_rate", 4))
 
-            tokens_in = count_tokens(token_counter, text)
-            compression_ratio = tokens_out / tokens_in if tokens_in > 0 else math.inf
-
-            rouge_l_f1 = compute_rouge(rouge_metric, decoded, text)
-
-            result = ExampleResult(
-                doc_id=doc_id,
-                text=text,
-                reconstruction=decoded,
-                compression_rate=rate,
-                tokens_in=tokens_in,
-                tokens_out=tokens_out,
-                compression_ratio=compression_ratio,
-                encode_time=encode_time,
-                decode_time=decode_time,
-                rouge_l_f1=rouge_l_f1,
-                bertscore_f1=0.0,  # placeholder updated later
+        try:
+            decoded, tokens_out, encode_time, decode_time = autoencode_example(
+                model, text, rate, device, agent=agent
             )
+        except Exception as exc:  # pragma: no cover - best effort logging
+            error_count += 1
+            print(f"Error processing example: {exc}")
+            continue
 
-            results.append(result)
-            references.append(text)
-            predictions.append(decoded)
+        tokens_in = count_tokens(token_counter, text)
+        compression_ratio = tokens_out / tokens_in if tokens_in > 0 else math.inf
+
+        rouge_l_f1 = compute_rouge(rouge_metric, decoded, text)
+
+        result = ExampleResult(
+            compression_rate=rate,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            compression_ratio=compression_ratio,
+            encode_time=encode_time,
+            decode_time=decode_time,
+            rouge_l_f1=rouge_l_f1,
+            bertscore_f1=0.0,  # placeholder updated later
+        )
+
+        results.append(result)
+        references.append(text)
+        predictions.append(decoded)
 
     if results:
         bert_outputs = bert_metric.compute(predictions=predictions, references=references, lang="en")
@@ -390,28 +379,27 @@ def evaluate_model(
         for item, score in zip(results, bert_f1):
             item.bertscore_f1 = float(score)
 
-        # Rewrite log with complete results including BERTScore
-        with log_path.open("w", encoding="utf-8") as log_file:
-            for item in results:
-                log_file.write(
-                    json.dumps(
-                        {
-                            "id": item.doc_id,
-                            "text": item.text,
-                            "reconstruction": item.reconstruction,
-                            "compression_rate": item.compression_rate,
-                            "tokens_in": item.tokens_in,
-                            "tokens_out": item.tokens_out,
-                            "compression_ratio": item.compression_ratio,
-                            "encode_time": item.encode_time,
-                            "decode_time": item.decode_time,
-                            "total_time": item.total_time,
-                            "rouge_l_f1": item.rouge_l_f1,
-                            "bertscore_f1": item.bertscore_f1,
-                        }
-                    )
-                    + "\n"
+    with log_path.open("w", encoding="utf-8") as log_file:
+        for item in results:
+            log_file.write(
+                json.dumps(
+                    {
+                        "compression_rate": item.compression_rate,
+                        "tokens_in": item.tokens_in,
+                        "tokens_out": item.tokens_out,
+                        "compression_ratio": item.compression_ratio,
+                        "encode_time": item.encode_time,
+                        "decode_time": item.decode_time,
+                        "total_time": item.total_time,
+                        "rouge_l_f1": item.rouge_l_f1,
+                        "bertscore_f1": item.bertscore_f1,
+                    }
                 )
+                + "\n"
+            )
+
+        if error_count:
+            log_file.write(json.dumps({"errors": error_count}) + "\n")
 
     return results
 
