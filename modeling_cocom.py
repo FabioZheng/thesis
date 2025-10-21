@@ -36,10 +36,26 @@ class BERT_Compressor(torch.nn.Module):
         hidden_states = []
 
         if self.compressing_mode == 'concat':
+            last_hidden = segment_compress_outputs.hidden_states[-1]
             for segment_idx in range(num_embs):
                 start_idx = segment_idx * rate
                 end_idx = (segment_idx + 1) * rate
-                hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
+                hidden_state = last_hidden[:, start_idx:end_idx, :]
+
+                if hidden_state.size(1) == 0:
+                    continue
+
+                if hidden_state.size(1) < rate:
+                    pad_len = rate - hidden_state.size(1)
+                    pad = torch.zeros(
+                        hidden_state.size(0),
+                        pad_len,
+                        hidden_state.size(2),
+                        device=hidden_state.device,
+                        dtype=hidden_state.dtype,
+                    )
+                    hidden_state = torch.cat((hidden_state, pad), dim=1)
+
                 hidden_state_concat = torch.flatten(hidden_state, start_dim=1)
                 hidden_states.append(hidden_state_concat)
         elif self.compressing_mode == "mean":
@@ -47,10 +63,23 @@ class BERT_Compressor(torch.nn.Module):
                 start_idx = segment_idx * rate
                 end_idx = (segment_idx + 1) * rate
                 hidden_state = segment_compress_outputs.hidden_states[-1][:, start_idx:end_idx, :]
+                if hidden_state.size(1) == 0:
+                    continue
                 hidden_state_mean = torch.mean(hidden_state, dim=1)
                 hidden_states.append(hidden_state_mean)
 
-        hidden_states = torch.stack(hidden_states, dim=1)
+        if not hidden_states:
+            # Degenerate case where the encoder produced no states (empty input).
+            # Return a zero embedding so downstream code can continue gracefully.
+            hidden_states = torch.zeros(
+                input_ids.size(0),
+                1,
+                self.linears[idx].in_features,
+                device=input_ids.device,
+                dtype=segment_compress_outputs.hidden_states[-1].dtype,
+            )
+        else:
+            hidden_states = torch.stack(hidden_states, dim=1)
         return self.linears[idx](hidden_states)
 
     def forward(self, input_ids, attention_mask, rate=None):
