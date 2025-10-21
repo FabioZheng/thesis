@@ -12,7 +12,8 @@ import math
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from itertools import chain
 import pickle
 from collections import Counter
 
@@ -119,27 +120,30 @@ def parse_args() -> EvaluationConfig:
     )
 
 
-def load_dataset_records(dataset_name: str, split: str, max_samples: Optional[int]) -> List[Dict[str, str]]:
-    dataset = hf_load_dataset(dataset_name, split=split)
-
-    if max_samples is not None:
-        max_samples = min(max_samples, len(dataset))
-        dataset = dataset.select(range(max_samples))
-
-    records: List[Dict[str, str]] = []
-    for example in dataset:
-        text = example.get("text")
-        if text is None:
-            continue
-
-        record: Dict[str, str] = {"text": text}
-        for candidate in ("id", "doc_id", "uid"):
-            if candidate in example and example[candidate] is not None:
-                record["id"] = str(example[candidate])
+def load_dataset_records(
+    dataset_name: str, split: str, max_samples: Optional[int]
+) -> Callable[[], Iterator[Dict[str, str]]]:
+    def record_iterator() -> Iterator[Dict[str, str]]:
+        dataset = hf_load_dataset(dataset_name, split=split, streaming=True)
+        count = 0
+        for example in dataset:
+            if max_samples is not None and count >= max_samples:
                 break
-        records.append(record)
 
-    return records
+            text = example.get("text")
+            if text is None:
+                continue
+
+            record: Dict[str, str] = {"text": text}
+            for candidate in ("id", "doc_id", "uid"):
+                if candidate in example and example[candidate] is not None:
+                    record["id"] = str(example[candidate])
+                    break
+
+            count += 1
+            yield record
+
+    return record_iterator
 
 
 def ensure_dir(path: Path) -> None:
@@ -317,7 +321,7 @@ def evaluate_model(
     name: str,
     model: COCOM,
     default_rate: Optional[int],
-    dataset: Sequence[Dict[str, str]],
+    dataset: Iterable[Dict[str, str]],
     device: torch.device,
     token_counter: Any,
     save_dir: Path,
@@ -328,17 +332,21 @@ def evaluate_model(
     rouge_metric = Rouge(metrics=["rouge-l"])
     bert_metric = evaluate.load("bertscore")
 
-    # Warm-up on the first document if available
-    if dataset:
-        warmup_rate = default_rate if default_rate is not None else getattr(model, "current_rate", 4)
-        warmup_model(model, dataset[0]["text"], warmup_rate, device)
+    dataset_iter = iter(dataset)
+    try:
+        first_example = next(dataset_iter)
+    except StopIteration:
+        return []
+
+    warmup_rate = default_rate if default_rate is not None else getattr(model, "current_rate", 4)
+    warmup_model(model, first_example["text"], warmup_rate, device)
 
     results: List[ExampleResult] = []
     references: List[str] = []
     predictions: List[str] = []
 
     with log_path.open("w", encoding="utf-8") as log_file:
-        for example in tqdm(dataset, desc=f"Evaluating {name}"):
+        for example in tqdm(chain([first_example], dataset_iter), desc=f"Evaluating {name}"):
             text = example["text"]
             doc_id = example.get("id")
 
@@ -513,9 +521,16 @@ def main() -> None:
     config = parse_args()
     ensure_dir(config.save_dir)
 
-    dataset = load_dataset_records(config.dataset_name, config.dataset_split, config.max_samples)
-    if not dataset:
-        raise ValueError("Dataset is empty or could not be parsed.")
+    dataset_iterator_factory = load_dataset_records(
+        config.dataset_name, config.dataset_split, config.max_samples
+    )
+
+    initial_iter = dataset_iterator_factory()
+    try:
+        first_record = next(initial_iter)
+    except StopIteration as exc:
+        raise ValueError("Dataset is empty or could not be parsed.") from exc
+    adaptive_dataset = chain([first_record], initial_iter)
 
     all_results: Dict[str, List[ExampleResult]] = {}
     summaries: Dict[str, Dict[str, Dict[str, float]]] = {}
@@ -529,7 +544,7 @@ def main() -> None:
         name="adaptive",
         model=adaptive_model,
         default_rate=None,
-        dataset=dataset,
+        dataset=adaptive_dataset,
         device=config.device,
         token_counter=token_counter,
         save_dir=config.save_dir,
@@ -548,7 +563,7 @@ def main() -> None:
             name=name,
             model=model,
             default_rate=rate,
-            dataset=dataset,
+            dataset=dataset_iterator_factory(),
             device=config.device,
             token_counter=token_counter,
             save_dir=config.save_dir,
