@@ -244,7 +244,7 @@ def generate_contexts(
             texts,
             return_tensors="pt",
             truncation=True,
-            max_length=512,
+            max_length=256,
             padding="longest",
         )
 

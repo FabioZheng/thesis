@@ -5,7 +5,7 @@ import torch
 def get_fine_tuning_args():
     """Argument parser dedicated to the QA RAG fine-tuning pipeline."""
     parser = argparse.ArgumentParser(description="RAG QA Fine-tuning Configuration")
-    parser.add_argument("--doc_max_length", type=int, default=128)
+    parser.add_argument("--doc_max_length", type=int, default=256)
     parser.add_argument(
         "--model_name_or_path",
         type=str,
