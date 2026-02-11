@@ -309,6 +309,54 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
             yield dict(row)
 
 
+
+
+def _looks_like_local_path(value: str) -> bool:
+    expanded = os.path.expanduser(value)
+    return (
+        os.path.sep in expanded
+        or (os.path.altsep is not None and os.path.altsep in expanded)
+        or expanded.startswith(".")
+        or expanded.startswith("~")
+        or os.path.splitext(expanded)[1].lower() in {".json", ".jsonl", ".ndjson"}
+    )
+
+
+def _resolve_dataset_source(
+    dataset_source: RowIterable,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> RowIterable:
+    if not isinstance(dataset_source, str):
+        return dataset_source
+
+    expanded_source = os.path.expanduser(dataset_source)
+    if os.path.isfile(expanded_source):
+        return expanded_source
+
+    if _looks_like_local_path(dataset_source):
+        raise FileNotFoundError(
+            f"Dataset file not found: {dataset_source} (resolved: {os.path.abspath(expanded_source)})"
+        )
+
+    dataset_identifier = dataset_source
+    load_kwargs = dict(load_dataset_kwargs or {})
+    if split is not None:
+        load_kwargs.setdefault("split", split)
+    if name is not None:
+        load_kwargs.setdefault("name", name)
+
+    try:
+        return load_dataset(dataset_identifier, **load_kwargs)
+    except Exception as error:  # pragma: no cover - network/IO heavy
+        raise ValueError(
+            "Failed to load dataset using datasets.load_dataset; "
+            f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
+        ) from error
+
+
 def load_and_flatten(
     dataset_source: RowIterable,
     *,
@@ -333,21 +381,12 @@ def load_and_flatten(
     original row.
     """
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
@@ -410,21 +449,12 @@ def load_queries(
 ) -> Dict[str, Dict[str, str]]:
     """Load a dataset-like object and extract a mapping of query_id to text."""
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     queries: Dict[str, Dict[str, str]] = {}
 
@@ -452,21 +482,12 @@ def load_answers(
 ) -> Dict[str, list[str]]:
     """Load a dataset-like object and map each query_id to its answer texts."""
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     answers: Dict[str, list[str]] = {}
 
