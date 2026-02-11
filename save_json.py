@@ -462,13 +462,19 @@ def load_queries(
         query_id = _extract_query_id(row)
         if query_id is None:
             continue
-        answers = _extract_answer_texts(row)
-        if _is_placeholder_only_answers(answers):
-            continue
+
         query_text = _extract_query_text(row)
         if not query_text:
             continue
-        queries[str(query_id)] = {"text": query_text}
+
+        query_payload: Dict[str, str] = {"text": query_text}
+        answer_texts = _extract_answer_texts(row)
+        if not _is_placeholder_only_answers(answer_texts):
+            filtered_answers = _filter_placeholder_answers(answer_texts)
+            if filtered_answers:
+                query_payload["answers"] = filtered_answers
+
+        queries[str(query_id)] = query_payload
 
     return queries
 
