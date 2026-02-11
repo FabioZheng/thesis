@@ -466,13 +466,7 @@ def load_local_qa_splits(
             ]
 
     if not train_examples:
-        total_queries = sum(len(split_queries) for split_queries in queries_by_split.values())
-        raise ValueError(
-            "No training queries available after processing local JSON files. "
-            f"Loaded {total_queries} query records from '{queries_path}' but none had usable "
-            "question+answer pairs. Ensure --rag_answers_path points to answers JSON with "
-            "matching query_ids, or include answers inside the queries JSON payload."
-        )
+        raise ValueError("No training queries available after processing local JSON files.")
     if not eval_examples:
         raise ValueError("No evaluation queries available after processing local JSON files.")
 
