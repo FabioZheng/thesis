@@ -709,6 +709,13 @@ def main() -> None:
     with open(queries_path, "r", encoding="utf-8") as handle:
         queries_payload = json.load(handle)
 
+    if not queries_payload:
+        print(
+            "No query text payloads were extracted from the dataset source; "
+            "skipping query embedding generation."
+        )
+        return
+
     query_ids_array, query_texts_array, query_embeddings = generate_query_embeddings(
         queries_payload,
         embedder,

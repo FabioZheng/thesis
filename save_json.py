@@ -254,6 +254,32 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
     if isinstance(dataset_source, str):
         if not os.path.isfile(dataset_source):
             raise FileNotFoundError(f"Dataset file not found: {dataset_source}")
+        _, extension = os.path.splitext(dataset_source)
+        extension = extension.lower()
+
+        if extension == ".json":
+            with open(dataset_source, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+            if isinstance(payload, Mapping):
+                values = list(payload.values())
+                if all(isinstance(value, Mapping) for value in values):
+                    for value in values:
+                        yield dict(value)
+                    return
+
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, Mapping):
+                        yield dict(item)
+                    else:
+                        yield {"text": str(item)}
+                return
+
+            raise TypeError(
+                "Unsupported JSON structure in dataset file; expected an object or array."
+            )
+
         frame = pd.read_json(dataset_source, lines=True)
         for row in frame.to_dict(orient="records"):
             yield row
@@ -334,12 +360,20 @@ def load_and_flatten(
         row_iterable = islice(row_iterable, limit)
 
     for row in tqdm(row_iterable, desc="Flattening dataset", unit="row"):
+        row_keys = {
+            key.lower() for key in row.keys() if isinstance(key, str)
+        }
         query_id = _extract_query_id(row)
         passage_texts = _extract_passage_texts(row)
         if not passage_texts and "text" in row:
             passage_texts = _flatten_text_container(row["text"])
         answer_texts = _extract_answer_texts(row)
-        if _is_placeholder_only_answers(answer_texts):
+        is_preflattened_record = (
+            "text" in row_keys
+            and query_id is not None
+            and not any(key in row_keys for key in ANSWER_CONTAINER_KEYS_LOWER)
+        )
+        if _is_placeholder_only_answers(answer_texts) and not is_preflattened_record:
             continue
         answer_texts = _filter_placeholder_answers(answer_texts)
 
