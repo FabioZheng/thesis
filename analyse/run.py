@@ -668,11 +668,20 @@ def main():
                     model_name="sentence-transformers/all-MiniLM-L6-v2"
                 )
                 deviations = []
+                entropies = []
                 with st.spinner(f"Computing info density on up to {len(docs_series)} docs..."):
                     for doc in docs_series:
                         try:
                             res = evaluator.evaluate(doc, trials=int(trials), remove_frac=float(remove_frac))
                             deviations.append(res["avg_deviation"])
+
+                            tokens = [tok for tok in re.findall(r"\w+", doc.lower()) if tok]
+                            if tokens:
+                                token_counts = Counter(tokens)
+                                probs = np.array(list(token_counts.values()), dtype=np.float64) / len(tokens)
+                                entropies.append(float(-(probs * np.log2(probs + 1e-12)).sum()))
+                            else:
+                                entropies.append(0.0)
                         except Exception:
                             # Skip problematic rows quietly
                             continue
@@ -686,6 +695,24 @@ def main():
                     with c2:
                         st.metric("Std. Dev.", f"{std_density:.4f}")
                     st.caption("Density = mean embedding deviation after removing a 10% contiguous span, averaged over trials:contentReference[oaicite:2]{index=2}.")
+
+                    st.subheader("Document Entropy Distribution")
+                    entropy_avg = float(np.mean(entropies)) if entropies else 0.0
+                    entropy_std = float(np.std(entropies)) if entropies else 0.0
+                    e1, e2 = st.columns(2)
+                    with e1:
+                        st.metric("Avg Token Entropy", f"{entropy_avg:.4f} bits")
+                    with e2:
+                        st.metric("Token Entropy Std. Dev.", f"{entropy_std:.4f} bits")
+
+                    if entropies:
+                        entropy_fig = px.histogram(
+                            x=entropies,
+                            nbins=30,
+                            title="Distribution of Per-Document Token Entropy",
+                            labels={"x": "Token entropy (bits)", "y": "Frequency"},
+                        )
+                        st.plotly_chart(entropy_fig, use_container_width=True)
                 else:
                     st.info("No deviations computed (empty/invalid docs?). Try a different column or adjust settings.")
         else:
