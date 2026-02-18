@@ -19,6 +19,13 @@ from plotly.subplots import make_subplots
 import warnings
 # Add near top of run.py
 from info_density import InformationDensityEvaluator
+from metrics import batch_entropy
+
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
 
 
 # HF datasets (optional)
@@ -509,6 +516,109 @@ def _restore_into(analyzer: DatasetAnalyzer):
         analyzer.queries_df = st.session_state.get("_queries_df")
 
 
+def _build_token_tensors(docs):
+    """Build token-id and attention-mask tensors for metrics.batch_entropy."""
+    tokenized_docs = []
+    vocab = {}
+
+    for doc in docs:
+        tokens = re.findall(r"\w+", str(doc).lower())
+        doc_ids = []
+        for tok in tokens:
+            if tok not in vocab:
+                vocab[tok] = len(vocab) + 1
+            doc_ids.append(vocab[tok])
+        tokenized_docs.append(doc_ids)
+
+    max_len = max((len(x) for x in tokenized_docs), default=0)
+    if max_len == 0:
+        return None, None
+
+    input_ids = []
+    attention_mask = []
+    for ids in tokenized_docs:
+        pad_len = max_len - len(ids)
+        input_ids.append(ids + [0] * pad_len)
+        attention_mask.append([1] * len(ids) + [0] * pad_len)
+
+    return torch.tensor(input_ids), torch.tensor(attention_mask)
+
+
+def render_entropy_module(analyzer: DatasetAnalyzer):
+    st.header("📈 Document Entropy")
+    st.caption("Per-document entropy is computed via `metrics.batch_entropy`.")
+
+    if not analyzer.text_columns:
+        st.info("Select at least one text column in the sidebar to run entropy analysis.")
+        return
+
+    if not TORCH_AVAILABLE:
+        st.warning("`torch` is required for this module because `metrics.batch_entropy` expects tensor masks.")
+        return
+
+    entropy_col = st.selectbox(
+        "Text column for entropy:",
+        analyzer.text_columns,
+        index=0,
+        key="__entropy_col"
+    )
+    entropy_max_docs = st.number_input(
+        "Max docs for entropy computation",
+        min_value=10,
+        max_value=20000,
+        value=1000,
+        step=10,
+        key="__entropy_max_docs"
+    )
+
+    if st.button("Compute Entropy", key="__compute_entropy"):
+        docs_series = analyzer.dataset[entropy_col].dropna().astype(str)
+        if len(docs_series) > entropy_max_docs:
+            docs_series = docs_series.head(int(entropy_max_docs))
+
+        input_ids, attention_mask = _build_token_tensors(docs_series.tolist())
+        if input_ids is None:
+            st.info("No valid tokens found in selected documents.")
+            return
+
+        entropies = batch_entropy(input_ids=input_ids, attention_mask=attention_mask)
+        entropy_df = pd.DataFrame(
+            {
+                "doc_index": docs_series.index,
+                "entropy": entropies,
+            }
+        )
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("Documents", len(entropy_df))
+        with c2:
+            st.metric("Average Entropy", f"{float(np.mean(entropies)):.4f}")
+        with c3:
+            st.metric("Std Entropy", f"{float(np.std(entropies)):.4f}")
+
+        hist_fig = px.histogram(
+            entropy_df,
+            x="entropy",
+            nbins=40,
+            title="Distribution of Document Entropy",
+            labels={"entropy": "Entropy", "count": "Documents"},
+        )
+        st.plotly_chart(hist_fig, use_container_width=True)
+
+        line_fig = px.line(
+            entropy_df,
+            x="doc_index",
+            y="entropy",
+            markers=True,
+            title="Document Entropy by Row Index",
+            labels={"doc_index": "Document Index", "entropy": "Entropy"},
+        )
+        st.plotly_chart(line_fig, use_container_width=True)
+
+        st.dataframe(entropy_df.head(200), use_container_width=True)
+
+
 def main():
     st.set_page_config(page_title="ML Dataset Analyzer", page_icon="📊", layout="wide")
     st.title("🔍 ML Dataset Analyzer")
@@ -700,6 +810,9 @@ def main():
             queries=analyzer.queries_df,
         )
         render_clustering_block()
+
+        # Entropy module (document-level entropy via metrics.batch_entropy)
+        render_entropy_module(analyzer)
 
 
 if __name__ == "__main__":

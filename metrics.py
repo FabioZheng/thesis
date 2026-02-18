@@ -85,13 +85,16 @@ def compute_rouge_scores(rouge, predictions, references):
     return {'Rouge-1': np.mean(rouge1), 'Rouge-2': np.mean(rouge2), 'Rouge-L': np.mean(rougel)}
 
 
-# Pre-load metrics
+# Pre-load lightweight metrics
 rouge = Rouge()
-bertscore = evaluate.load("bertscore")
+bertscore = None
 
 
 def compute_bertscore(predictions: List[str], references: List[str]) -> float:
     """Return average F1 BERTScore for predictions vs references."""
+    global bertscore
+    if bertscore is None:
+        bertscore = evaluate.load("bertscore")
     scores = bertscore.compute(predictions=predictions, references=references, lang="en")
     return sum(scores["f1"]) / len(scores["f1"])
 
@@ -114,5 +117,4 @@ def batch_entropy(input_ids, attention_mask) -> List[float]:
         ent = -sum(p * math.log(p, 2) for p in probs)
         entropies.append(ent)
     return entropies
-
 
