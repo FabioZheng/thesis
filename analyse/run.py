@@ -223,6 +223,78 @@ class DatasetAnalyzer:
                 break
         return df
 
+    def build_docs_payload(self, text_column, query_id_column=None, answers_column=None):
+        """Build docs.json-compatible payload: {doc_id: {query_id, text, answers?}}."""
+        if self.dataset is None or text_column not in self.dataset.columns:
+            return {}
+
+        docs = {}
+        doc_id = 0
+
+        for _, row in self.dataset.iterrows():
+            text_value = row.get(text_column)
+            if self._is_missing(text_value):
+                continue
+
+            text = self._coerce_nested_text(text_value).strip()
+            if not text:
+                continue
+
+            query_id = None
+            if query_id_column and query_id_column in self.dataset.columns:
+                q_val = row.get(query_id_column)
+                if not self._is_missing(q_val):
+                    query_id = str(q_val)
+
+            record = {
+                "query_id": query_id,
+                "text": text,
+            }
+
+            if answers_column and answers_column in self.dataset.columns:
+                ans_val = row.get(answers_column)
+                if not self._is_missing(ans_val):
+                    answers = [a.strip() for a in self._flatten_text_container(ans_val) if str(a).strip()]
+                    if answers:
+                        record["answers"] = answers
+
+            docs[doc_id] = record
+            doc_id += 1
+
+        return docs
+
+    def _flatten_text_container(self, value):
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("{") or stripped.startswith("["):
+                try:
+                    return self._flatten_text_container(json.loads(stripped))
+                except Exception:
+                    return [value]
+            return [value]
+        if isinstance(value, dict):
+            out = []
+            for item in value.values():
+                out.extend(self._flatten_text_container(item))
+            return out
+        if isinstance(value, (list, tuple, set)):
+            out = []
+            for item in value:
+                out.extend(self._flatten_text_container(item))
+            return out
+        return [str(value)]
+
+    def _is_missing(self, value):
+        if value is None:
+            return True
+        if isinstance(value, float) and np.isnan(value):
+            return True
+        return False
+
     def get_basic_info(self):
         if self.dataset is None:
             return None
@@ -600,6 +672,49 @@ def main():
                     if analyzer.dataset is not None:
                         st.success(f"Loaded {analyzer.dataset_name}!")
                         _persist_after_load(analyzer)
+
+        if analyzer.dataset is not None and str(analyzer.dataset_name).startswith("HF:"):
+            st.sidebar.markdown("---")
+            st.sidebar.caption("Export loaded HF rows as docs.json-compatible payload")
+            export_text_col = st.sidebar.selectbox(
+                "Text column for docs.json",
+                options=list(analyzer.dataset.columns),
+                index=0 if "text" not in analyzer.dataset.columns else list(analyzer.dataset.columns).index("text"),
+                key="__hf_export_text_col"
+            )
+
+            query_choices = ["(none)"] + list(analyzer.dataset.columns)
+            export_query_col = st.sidebar.selectbox(
+                "Query ID column (optional)",
+                options=query_choices,
+                index=query_choices.index("query_id") if "query_id" in analyzer.dataset.columns else 0,
+                key="__hf_export_qid_col"
+            )
+            export_query_col = None if export_query_col == "(none)" else export_query_col
+
+            answer_choices = ["(none)"] + list(analyzer.dataset.columns)
+            default_answer_idx = answer_choices.index("answers") if "answers" in analyzer.dataset.columns else 0
+            export_answers_col = st.sidebar.selectbox(
+                "Answers column (optional)",
+                options=answer_choices,
+                index=default_answer_idx,
+                key="__hf_export_answers_col"
+            )
+            export_answers_col = None if export_answers_col == "(none)" else export_answers_col
+
+            docs_payload = analyzer.build_docs_payload(
+                text_column=export_text_col,
+                query_id_column=export_query_col,
+                answers_column=export_answers_col,
+            )
+            docs_json = json.dumps(docs_payload, ensure_ascii=False, indent=2)
+            st.sidebar.download_button(
+                label="Download docs.json",
+                data=docs_json,
+                file_name="docs.json",
+                mime="application/json",
+                key="__hf_download_docs_json"
+            )
 
     # If we have a dataset, render config & visuals
     if analyzer.dataset is not None:
