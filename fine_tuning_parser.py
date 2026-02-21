@@ -59,6 +59,14 @@ def get_fine_tuning_args():
     parser.add_argument("--rag_contexts_path", type=str, default="data/contexts/contexts.h5")
     parser.add_argument("--rag_embeddings_path", type=str, default="data/embeddings/embeddings.npz")
     parser.add_argument("--rag_docs_path", type=str, default="data/docs.json")
+    parser.add_argument(
+        "--rag_use_doc_text_context",
+        action="store_true",
+        help=(
+            "Use retrieved document text from --rag_docs_path as the RAG context in prompts "
+            "instead of context embeddings from --rag_contexts_path."
+        ),
+    )
     parser.add_argument("--rag_queries_path", type=str, default="data/queries.json")
     parser.add_argument("--rag_query_embeddings_path", type=str, default="data/query_embeddings.npz")
     parser.add_argument(

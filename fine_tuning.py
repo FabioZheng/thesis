@@ -483,12 +483,20 @@ class RAGFineTuneDataset(Dataset):
         context_store_path: str,
         doc_id_to_index: Dict[str, int],
         top_k: int,
+        use_doc_text_context: bool = False,
+        docs_lookup: Optional[Dict[str, str]] = None,
     ) -> None:
-        if not os.path.exists(context_store_path):
-            raise FileNotFoundError(f"Context store not found at {context_store_path}")
+        self.use_doc_text_context = use_doc_text_context
+        self.docs_lookup = docs_lookup or {}
+        if not self.use_doc_text_context:
+            if not os.path.exists(context_store_path):
+                raise FileNotFoundError(f"Context store not found at {context_store_path}")
+            self.context_store_path = context_store_path
+            self.doc_id_to_index = doc_id_to_index
+        else:
+            self.context_store_path = ""
+            self.doc_id_to_index = {}
 
-        self.context_store_path = context_store_path
-        self.doc_id_to_index = doc_id_to_index
         self.top_k = top_k
         self.samples: List[Dict[str, object]] = []
 
@@ -511,20 +519,20 @@ class RAGFineTuneDataset(Dataset):
                 doc_ids: List[str] = []
                 for doc_id in retrieved_doc_ids:
                     key = _to_str_doc_id(doc_id)
-                    if key in self.doc_id_to_index:
+                    if self.use_doc_text_context:
+                        if key in self.docs_lookup:
+                            doc_ids.append(key)
+                    elif key in self.doc_id_to_index:
                         doc_ids.append(key)
-                if len(doc_ids) < top_k:
-                    # --- FIX: We can relax this. We don't need all top_k docs.
-                    # We can proceed even with 1 doc.
-                    if len(doc_ids) == 0:
-                        skipped_due_to_contexts += 1
-                        continue
+                if len(doc_ids) < top_k and len(doc_ids) == 0:
+                    skipped_due_to_contexts += 1
+                    continue
                 self.samples.append(
                     {
                         "query_id": example_info["query_id"],
                         "question": example_info["question"],
                         "answer": example_info["answer"],
-                        "doc_ids": doc_ids[:top_k],  # Keep all retrieved docs up to top_k
+                        "doc_ids": doc_ids[:top_k],
                     }
                 )
 
@@ -588,6 +596,16 @@ class RAGFineTuneDataset(Dataset):
         answer = sample["answer"]
         doc_ids: Iterable[str] = sample["doc_ids"]
 
+        if self.use_doc_text_context:
+            context_texts = [self.docs_lookup[doc_id] for doc_id in doc_ids if doc_id in self.docs_lookup]
+            if not context_texts:
+                raise ValueError("Missing context texts for retrieved document ids.")
+            return {
+                "question": question,
+                "answer": answer,
+                "context_texts": context_texts,
+            }
+
         context_tensors: List[torch.Tensor] = []
         with h5py.File(self.context_store_path, "r") as handle:
             contexts_ds = handle["contexts"]
@@ -614,104 +632,86 @@ class RAGFineTuneDataset(Dataset):
         if not context_tensors:
             raise ValueError("Missing context tensors for retrieved document ids.")
 
-        # --- FIX: REMOVED PADDING BLOCK ---
-        # We no longer pad the context_tensors to be the same length.
-        # We return a list of tensors with variable lengths.
-        #
-        # --- OLD CODE DELETED ---
-        # max_mem = max(tensor.size(0) for tensor in context_tensors)
-        # hidden = context_tensors[0].size(1)
-        # padded_contexts = []
-        # ... (padding loop) ...
-        # stacked = torch.stack(padded_contexts, dim=0)
-        # --- END OLD CODE ---
-
         return {
             "question": question,
             "answer": answer,
-            "context_embeddings": context_tensors,  # --- FIX: This is now a List[Tensor] ---
+            "context_embeddings": context_tensors,
         }
 
 
 @dataclass
 class RAGDataCollator:
     tokenizer: any
-    top_k: int  # This is now the *max* top_k, not a fixed number
+    top_k: int
     decoder_max_length: int
+    use_doc_text_context: bool = False
 
     def __call__(self, features: List[Dict[str, object]]) -> Dict[str, torch.Tensor]:
-        # --- FIX: START OF REWRITTEN __call__ METHOD ---
-        # This function is rewritten to handle "ragged" batches of embeddings
-        # where each document can have a different length (different # of MEM tokens).
-
         questions = [feature["question"] for feature in features]
         answers = [feature["answer"] for feature in features]
-        # context_embeddings is now a List[List[torch.Tensor]]
-        # e.g., batch[0] = [tensor(4,H), tensor(16,H), tensor(8,H)]
-        context_embeddings = [feature["context_embeddings"] for feature in features]
 
         bos = self.tokenizer.bos_token or ""
         mem_token_symbol = getattr(self.tokenizer, "mem_token", "") or ""
-        sep_token_symbol = getattr(self.tokenizer, "sep_token", "") or ""  # --- FIX: Get SEP token
-        if not mem_token_symbol:
-            raise ValueError("Tokenizer is missing 'mem_token'")
-        if not sep_token_symbol:
-            tqdm.write("Warning: Tokenizer is missing 'sep_token'. Document contexts will not be separated.")
+        sep_token_symbol = getattr(self.tokenizer, "sep_token", "") or ""
 
         prompts = []
         flat_context_tensors = []
-        # indices tensor tracks which docs belong to which batch item
-        # indices[i] -> start doc index, indices[i+1] -> end doc index
         indices = [0]
 
-        for i in range(len(features)):
-            question = questions[i]
-            sample_tensors = context_embeddings[i]  # List[Tensor] for this sample
-
-            # Calculate available token space, leaving room for question text
-            base_prompt = f"{bos}[INST]{question}\n[/INST]\n"
-            # Tokenize *without* special tokens to get true length
-            base_len = len(self.tokenizer(base_prompt, add_special_tokens=False)['input_ids'])
-            available_space = self.decoder_max_length - base_len
-
-            mem_blocks_for_sample = []
-            tensors_to_use = []
-            current_space_used = 0
-            sep_len = len(self.tokenizer(sep_token_symbol, add_special_tokens=False)['input_ids'])
-
-            for tensor in sample_tensors:
-                mem_len = tensor.size(0)  # The number of <MEM> tokens
-
-                # Check if this document (MEM tokens + SEP token) fits
-                if current_space_used + mem_len + sep_len <= available_space:
-                    # --- FIX: Add MEM block AND SEP token ---
-                    mem_blocks_for_sample.append((mem_token_symbol * mem_len) + sep_token_symbol)
-                    tensors_to_use.append(tensor)
-                    current_space_used += mem_len + sep_len
+        if self.use_doc_text_context:
+            for i in range(len(features)):
+                question = questions[i]
+                context_texts = features[i].get("context_texts", [])
+                context_block = "\n\n".join(
+                    str(text).strip() for text in context_texts if str(text).strip()
+                )
+                if context_block:
+                    prompt = f"{bos}[CONTEXT]\n{context_block}\n[/CONTEXT]\n[INST]{question}\n[/INST]\n"
                 else:
-                    # Stop adding docs if we run out of context space
-                    break
+                    prompt = f"{bos}[INST]{question}\n[/INST]\n"
+                prompts.append(prompt)
+                indices.append(0)
+        else:
+            if not mem_token_symbol:
+                raise ValueError("Tokenizer is missing 'mem_token'")
+            if not sep_token_symbol:
+                tqdm.write("Warning: Tokenizer is missing 'sep_token'. Document contexts will not be separated.")
 
-            # Create the final prompt string for this sample
-            mem_block_str = "".join(mem_blocks_for_sample)
-            prompts.append(f"{bos}{mem_block_str}[INST]{question}\n[/INST]\n")
+            for i in range(len(features)):
+                question = questions[i]
+                sample_tensors = features[i]["context_embeddings"]
+                base_prompt = f"{bos}[INST]{question}\n[/INST]\n"
+                base_len = len(self.tokenizer(base_prompt, add_special_tokens=False)["input_ids"])
+                available_space = self.decoder_max_length - base_len
 
-            # Add this sample's tensors to the flat batch list
-            flat_context_tensors.extend(tensors_to_use)
-            # Record the end index for this sample
-            indices.append(len(flat_context_tensors))
+                mem_blocks_for_sample = []
+                tensors_to_use = []
+                current_space_used = 0
+                sep_len = len(self.tokenizer(sep_token_symbol, add_special_tokens=False)["input_ids"])
 
-        # Tokenize all prompt strings (text part)
+                for tensor in sample_tensors:
+                    mem_len = tensor.size(0)
+                    if current_space_used + mem_len + sep_len <= available_space:
+                        mem_blocks_for_sample.append((mem_token_symbol * mem_len) + sep_token_symbol)
+                        tensors_to_use.append(tensor)
+                        current_space_used += mem_len + sep_len
+                    else:
+                        break
+
+                mem_block_str = "".join(mem_blocks_for_sample)
+                prompts.append(f"{bos}{mem_block_str}[INST]{question}\n[/INST]\n")
+                flat_context_tensors.extend(tensors_to_use)
+                indices.append(len(flat_context_tensors))
+
         dec_inputs = self.tokenizer(
             prompts,
             return_tensors="pt",
             padding="max_length",
             max_length=self.decoder_max_length,
             truncation=True,
-            add_special_tokens=False,  # We already added BOS manually
+            add_special_tokens=False,
         )
 
-        # --- FIX: Tokenize labels, adding EOS token for consistency ---
         answers_with_eos = [ans + (self.tokenizer.eos_token or "") for ans in answers]
         labels = self.tokenizer(
             answers_with_eos,
@@ -723,17 +723,19 @@ class RAGDataCollator:
         )["input_ids"]
         labels[labels == self.tokenizer.pad_token_id] = -100
 
-        # --- FIX: Pad the flat list of context tensors ---
-        # We now have a flat list of tensors (e.g., 8 docs for a batch of 2)
-        # We must pad them all to the *longest* tensor *in this flat list*
+        batch = {
+            "dec_input_ids": dec_inputs["input_ids"],
+            "dec_attention_mask": dec_inputs["attention_mask"],
+            "labels": labels,
+        }
 
-        # Get lengths of all tensors in the flat batch
+        if self.use_doc_text_context:
+            return batch
+
         context_lengths = torch.tensor([t.size(0) for t in flat_context_tensors], dtype=torch.long)
-
         if flat_context_tensors:
             max_len_in_batch = context_lengths.max().item()
             hidden_size = flat_context_tensors[0].size(1)
-
             padded_batch_tensors = []
             for tensor in flat_context_tensors:
                 pad_len = max_len_in_batch - tensor.size(0)
@@ -742,24 +744,18 @@ class RAGDataCollator:
                     padded_batch_tensors.append(torch.cat([tensor, pad], dim=0))
                 else:
                     padded_batch_tensors.append(tensor)
-
             context_batch = torch.stack(padded_batch_tensors, dim=0)
         else:
-            # Handle empty batch case
             context_batch = torch.empty(0, 0, 0, dtype=torch.float32)
-            max_len_in_batch = 0
-            hidden_size = 0
 
-        batch = {
-            "dec_input_ids": dec_inputs["input_ids"],
-            "dec_attention_mask": dec_inputs["attention_mask"],
-            "labels": labels,
-            "context_embeddings": context_batch,  # Shape (TotalDocs, MaxMem, H)
-            "context_indices": torch.tensor(indices, dtype=torch.long),  # Shape (BatchSize + 1)
-            "context_lengths": context_lengths,  # Shape (TotalDocs)
-        }
+        batch.update(
+            {
+                "context_embeddings": context_batch,
+                "context_indices": torch.tensor(indices, dtype=torch.long),
+                "context_lengths": context_lengths,
+            }
+        )
         return batch
-        # --- FIX: END OF REWRITTEN __call__ METHOD ---
 
 
 class FineTuningTrainer(Trainer):
@@ -811,7 +807,13 @@ class FineTuningTrainer(Trainer):
             # --- END FIX ---
 
         else:
-            outputs = model(**inputs)
+            model_to_call = model.module if hasattr(model, "module") else model
+            decoder_outputs = model_to_call.decoder(
+                input_ids=inputs["dec_input_ids"],
+                attention_mask=inputs["dec_attention_mask"],
+                labels=inputs.get("labels"),
+            )
+            outputs = {"loss": decoder_outputs.loss, "logits": [decoder_outputs.logits]}
         loss = outputs["loss"] if isinstance(outputs, dict) else outputs
         return (loss, outputs) if return_outputs else loss
 
@@ -1065,7 +1067,15 @@ def run_training_cycle(
     accelerator.wait_for_everyone()
     os.makedirs(model_output_dir, exist_ok=True)
 
-    context_index = load_context_store(args.rag_contexts_path)
+    docs_lookup = load_docs_lookup(args.rag_docs_path)
+
+    use_doc_text_context = bool(getattr(args, "rag_use_doc_text_context", False))
+    if use_doc_text_context and not docs_lookup:
+        raise ValueError(
+            "--rag_use_doc_text_context was enabled but no document texts were loaded from --rag_docs_path."
+        )
+
+    context_index = {} if use_doc_text_context else load_context_store(args.rag_contexts_path)
     retriever = load_retriever(args.rag_embeddings_path, args.rag_docs_path)
 
     query_embeddings_path = getattr(args, "rag_query_embeddings_path", None)
@@ -1081,8 +1091,6 @@ def run_training_cycle(
         answers_path=args.rag_answers_path,
     )
 
-    docs_lookup = load_docs_lookup(args.rag_docs_path)
-
     train_dataset = RAGFineTuneDataset(
         train_examples,
         retriever,
@@ -1091,6 +1099,8 @@ def run_training_cycle(
         args.rag_contexts_path,
         context_index,
         top_k=args.retriever_top_k,
+        use_doc_text_context=use_doc_text_context,
+        docs_lookup=docs_lookup,
     )
     eval_dataset = RAGFineTuneDataset(
         eval_examples,
@@ -1100,6 +1110,8 @@ def run_training_cycle(
         args.rag_contexts_path,
         context_index,
         top_k=args.retriever_top_k,
+        use_doc_text_context=use_doc_text_context,
+        docs_lookup=docs_lookup,
     )
 
     model = COCOM.from_pretrained(model_source, config=cfg)
@@ -1112,6 +1124,7 @@ def run_training_cycle(
         tokenizer=model.decoder_tokenizer,
         top_k=args.retriever_top_k,
         decoder_max_length=args.decoder_max_length,
+        use_doc_text_context=use_doc_text_context,
     )
 
     evaluation_strategy = "steps" if args.eval_every_steps > 0 else "no"
