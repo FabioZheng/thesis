@@ -844,7 +844,7 @@ def main():
 
         # Retrieval sandbox (embedding UI)
         st.header("🧭 Retrieval Sandbox")
-        from retrieval import CosineRetriever, TextEmbedder, render_embeddings_block, render_clustering_block
+        from retrieval import render_embeddings_block, render_clustering_block
         render_embeddings_block(
             analyzer.dataset,
             candidate_text_cols=analyzer.text_columns,
@@ -853,78 +853,51 @@ def main():
         render_clustering_block()
 
         if analyzer.dataset_name and analyzer.dataset_name.startswith("HF:"):
-            st.subheader("⬇️ Download Retrieved Docs JSON")
-            st.caption("Export retrieved passages in the same `{doc_id: {query_id, text}}` structure as save_json.py docs.json.")
+            st.subheader("⬇️ Download docs.json")
+            st.caption("Export docs in save_json.py format: `{doc_id: {query_id, text, ...}}`, where `query_id` comes from the source dataset row.")
 
-            hf_retrieval_top_k = st.number_input(
-                "Top-K docs per query for JSON export",
+            export_doc_count = st.number_input(
+                "Number of docs to export",
                 min_value=1,
-                max_value=100,
-                value=5,
-                step=1,
-                key="__hf_retrieval_top_k"
-            )
-            max_export_queries = st.number_input(
-                "Max queries to export (for speed)",
-                min_value=1,
-                max_value=100000,
-                value=1000,
-                step=100,
-                key="__hf_export_query_limit"
+                max_value=2000000,
+                value=20000,
+                step=1000,
+                key="__hf_docs_export_count"
             )
 
-            can_export = (
-                analyzer.queries_df is not None
-                and not analyzer.queries_df.empty
-                and "__embeddings" in st.session_state
-                and "__doc_ids" in st.session_state
-                and "__store" in st.session_state
-                and "__embedder_name" in st.session_state
-            )
+            if st.button("Prepare docs.json", key="__prepare_hf_docs_json"):
+                with st.spinner("Flattening HF dataset to docs.json format..."):
+                    try:
+                        from save_json import load_and_flatten
 
-            if not can_export:
-                st.info("Build embeddings first and load a dataset with detectable query text to enable export.")
-            elif st.button("Prepare retrieved docs JSON", key="__prepare_hf_retrieval_json"):
-                export_queries = analyzer.queries_df[["query_id", "query_text"]].dropna().head(int(max_export_queries))
+                        rows = analyzer.dataset.to_dict(orient="records")
+                        docs_payload = load_and_flatten(rows)
 
-                with st.spinner("Retrieving top documents for queries..."):
-                    q_embedder = TextEmbedder(model_name=st.session_state["__embedder_name"], normalize=False)
-                    retriever = CosineRetriever(
-                        embeddings=st.session_state["__embeddings"],
-                        doc_ids=st.session_state["__doc_ids"],
-                        store=st.session_state["__store"],
-                    )
-
-                    docs_payload = {}
-                    next_doc_id = 0
-                    for _, row in export_queries.iterrows():
-                        query_id = str(row["query_id"])
-                        query_text = str(row["query_text"])
-                        hits = retriever.search(query_text, q_embedder, k=int(hf_retrieval_top_k))
-                        for _, _, retrieved_text in hits:
-                            docs_payload[next_doc_id] = {
-                                "query_id": query_id,
-                                "text": str(retrieved_text),
+                        if export_doc_count is not None and export_doc_count >= 0:
+                            docs_payload = {
+                                doc_id: payload
+                                for doc_id, payload in list(docs_payload.items())[: int(export_doc_count)]
                             }
-                            next_doc_id += 1
 
-                    st.session_state["__hf_retrieved_docs_json"] = json.dumps(
-                        docs_payload,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                    st.session_state["__hf_retrieved_docs_count"] = len(docs_payload)
+                        st.session_state["__hf_docs_json"] = json.dumps(
+                            docs_payload,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        st.session_state["__hf_docs_count"] = len(docs_payload)
+                    except Exception as export_error:
+                        st.error(f"Failed to prepare docs.json: {export_error}")
 
-            if "__hf_retrieved_docs_json" in st.session_state:
+            if "__hf_docs_json" in st.session_state:
                 st.success(
-                    f"Prepared {st.session_state.get('__hf_retrieved_docs_count', 0):,} retrieved docs for download."
+                    f"Prepared {st.session_state.get('__hf_docs_count', 0):,} docs for download."
                 )
                 st.download_button(
-                    "Download retrieved_docs.json",
-                    data=st.session_state["__hf_retrieved_docs_json"],
-                    file_name="retrieved_docs.json",
+                    "Download docs.json",
+                    data=st.session_state["__hf_docs_json"],
+                    file_name="docs.json",
                     mime="application/json",
-                    key="__download_hf_retrieved_docs_json"
+                    key="__download_hf_docs_json"
                 )
 
         # Entropy module (document-level entropy via metrics.batch_entropy)
