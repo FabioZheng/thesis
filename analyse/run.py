@@ -780,18 +780,47 @@ def main():
                 if len(docs_series) > max_docs:
                     docs_series = docs_series.head(max_docs)
 
-                evaluator = InformationDensityEvaluator(
-                    model_name="sentence-transformers/all-MiniLM-L6-v2"
-                )
                 deviations = []
-                with st.spinner(f"Computing info density on up to {len(docs_series)} docs..."):
+                entropies = []
+
+                try:
+                    evaluator = InformationDensityEvaluator(
+                        model_name="sentence-transformers/all-MiniLM-L6-v2"
+                    )
+                    density_available = True
+                except Exception as exc:
+                    evaluator = None
+                    density_available = False
+                    st.warning(f"Information density model unavailable ({exc}). Showing entropy distribution only.")
+
+                with st.spinner(f"Computing metrics on up to {len(docs_series)} docs..."):
                     for doc in docs_series:
-                        try:
-                            res = evaluator.evaluate(doc, trials=int(trials), remove_frac=float(remove_frac))
-                            deviations.append(res["avg_deviation"])
-                        except Exception:
-                            # Skip problematic rows quietly
-                            continue
+                        tokens = [tok for tok in re.findall(r"\w+", doc.lower()) if tok]
+                        if tokens:
+                            token_counts = Counter(tokens)
+                            probs = np.array(list(token_counts.values()), dtype=np.float64) / len(tokens)
+                            entropies.append(float(-(probs * np.log2(probs + 1e-12)).sum()))
+                        else:
+                            entropies.append(0.0)
+
+                        if density_available and evaluator is not None:
+                            try:
+                                res = evaluator.evaluate(doc, trials=int(trials), remove_frac=float(remove_frac))
+                                deviations.append(res["avg_deviation"])
+                            except Exception:
+                                continue
+
+                st.session_state["_info_density_results"] = {
+                    "deviations": deviations,
+                    "entropies": entropies,
+                    "num_docs": int(len(docs_series)),
+                    "col": id_text_col,
+                }
+
+            info_density_results = st.session_state.get("_info_density_results")
+            if info_density_results and info_density_results.get("col") == id_text_col:
+                deviations = info_density_results.get("deviations", [])
+                entropies = info_density_results.get("entropies", [])
 
                 if deviations:
                     avg_density = float(np.mean(deviations))
@@ -801,9 +830,29 @@ def main():
                         st.metric("Average Information Density", f"{avg_density:.4f}")
                     with c2:
                         st.metric("Std. Dev.", f"{std_density:.4f}")
-                    st.caption("Density = mean embedding deviation after removing a 10% contiguous span, averaged over trials:contentReference[oaicite:2]{index=2}.")
+                    st.caption("Density = mean embedding deviation after removing a 10% contiguous span, averaged over trials.")
                 else:
-                    st.info("No deviations computed (empty/invalid docs?). Try a different column or adjust settings.")
+                    st.info("No information-density scores were computed for the selected docs.")
+
+                st.subheader("Document Entropy Distribution")
+                entropy_avg = float(np.mean(entropies)) if entropies else 0.0
+                entropy_std = float(np.std(entropies)) if entropies else 0.0
+                e1, e2 = st.columns(2)
+                with e1:
+                    st.metric("Avg Token Entropy", f"{entropy_avg:.4f} bits")
+                with e2:
+                    st.metric("Token Entropy Std. Dev.", f"{entropy_std:.4f} bits")
+
+                if entropies:
+                    entropy_fig = px.histogram(
+                        x=entropies,
+                        nbins=30,
+                        title="Distribution of Per-Document Token Entropy",
+                        labels={"x": "Token entropy (bits)", "y": "Frequency"},
+                    )
+                    st.plotly_chart(entropy_fig, use_container_width=True)
+                else:
+                    st.info("No entropy scores could be computed for the selected docs.")
         else:
             st.info("Select at least one text column in the sidebar to compute information density.")
 
