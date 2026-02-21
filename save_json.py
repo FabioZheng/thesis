@@ -373,6 +373,7 @@ def load_queries(
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
+    limit: int | None = None,
 ) -> Dict[str, Dict[str, str]]:
     """Load a dataset-like object and extract a mapping of query_id to text."""
 
@@ -392,9 +393,16 @@ def load_queries(
                 f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
             ) from error
 
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+
     queries: Dict[str, Dict[str, str]] = {}
 
-    for row in _iter_rows(dataset_source):
+    row_iterable = _iter_rows(dataset_source)
+    if limit is not None:
+        row_iterable = islice(row_iterable, limit)
+
+    for row in row_iterable:
         query_id = _extract_query_id(row)
         if query_id is None:
             continue
@@ -415,6 +423,7 @@ def load_answers(
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
+    limit: int | None = None,
 ) -> Dict[str, list[str]]:
     """Load a dataset-like object and map each query_id to its answer texts."""
 
@@ -434,9 +443,16 @@ def load_answers(
                 f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
             ) from error
 
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be non-negative")
+
     answers: Dict[str, list[str]] = {}
 
-    for row in _iter_rows(dataset_source):
+    row_iterable = _iter_rows(dataset_source)
+    if limit is not None:
+        row_iterable = islice(row_iterable, limit)
+
+    for row in row_iterable:
         query_id = _extract_query_id(row)
         if query_id is None:
             continue
@@ -556,6 +572,7 @@ def save_queries_json(
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
+    limit: int | None = None,
 ) -> Tuple[str, Dict[str, float]]:
     """Extract queries and persist them as ``{"query_id": {"text": ...}}`` JSON."""
 
@@ -564,6 +581,7 @@ def save_queries_json(
         split=split,
         name=name,
         load_dataset_kwargs=load_dataset_kwargs,
+        limit=limit,
     )
 
     filtered_queries = _filter_payloads_by_query_ids(queries, query_ids)
@@ -581,6 +599,7 @@ def save_answers_json(
     split: str | None = None,
     name: str | None = None,
     load_dataset_kwargs: Mapping[str, Any] | None = None,
+    limit: int | None = None,
 ) -> Tuple[str, Dict[str, float]]:
     """Extract answers and persist them as ``{"query_id": [...]}`` JSON."""
 
@@ -589,6 +608,7 @@ def save_answers_json(
         split=split,
         name=name,
         load_dataset_kwargs=load_dataset_kwargs,
+        limit=limit,
     )
 
     filtered_answers = _filter_payloads_by_query_ids(answers, query_ids)
@@ -696,7 +716,13 @@ def main() -> None:
 
     if args.queries_out:
         print("🧾 Extracting queries")
-        queries = load_queries(dataset)
+        query_ids = {
+            payload.get("query_id")
+            for payload in docs.values()
+            if payload.get("query_id") is not None
+        }
+        queries = load_queries(dataset, limit=args.limit)
+        queries = _filter_payloads_by_query_ids(queries, query_ids or None)
         if not queries:
             print("⚠️ No queries found in dataset; skipping query export.")
         else:
