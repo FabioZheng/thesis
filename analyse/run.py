@@ -220,7 +220,7 @@ class DatasetAnalyzer:
 
         self.dataset = df
         self.dataset_name = f"HF:{path}" + (f"/{name}" if name else "") + f" [{split}]"
-        self.queries_df = None
+        self.queries_df = self._extract_queries_dataframe(df)
 
         self.text_columns = []
         for col in df.columns:
@@ -235,6 +235,41 @@ class DatasetAnalyzer:
                 self.target_column = guess
                 break
         return df
+
+    def _extract_queries_dataframe(self, df):
+        if df is None or df.empty:
+            return None
+
+        query_id_col = None
+        for candidate in ["query_id", "qid", "question_id", "id"]:
+            if candidate in df.columns:
+                query_id_col = candidate
+                break
+
+        query_text_col = None
+        for candidate in ["query", "query_text", "question", "question_text"]:
+            if candidate in df.columns:
+                query_text_col = candidate
+                break
+
+        if query_text_col is None:
+            return None
+
+        if query_id_col is None:
+            query_frame = df[[query_text_col]].dropna().copy()
+            query_frame = query_frame.rename(columns={query_text_col: "query_text"})
+            query_frame["query_id"] = [str(i) for i in range(len(query_frame))]
+        else:
+            query_frame = df[[query_id_col, query_text_col]].dropna().copy()
+            query_frame = query_frame.rename(columns={query_id_col: "query_id", query_text_col: "query_text"})
+
+        if query_frame.empty:
+            return None
+
+        query_frame["query_id"] = query_frame["query_id"].astype(str)
+        query_frame["query_text"] = query_frame["query_text"].astype(str)
+        query_frame = query_frame.drop_duplicates(subset=["query_id", "query_text"]).reset_index(drop=True)
+        return query_frame if not query_frame.empty else None
 
     def get_basic_info(self):
         if self.dataset is None:
@@ -809,13 +844,88 @@ def main():
 
         # Retrieval sandbox (embedding UI)
         st.header("🧭 Retrieval Sandbox")
-        from retrieval import render_embeddings_block, render_clustering_block
+        from retrieval import CosineRetriever, TextEmbedder, render_embeddings_block, render_clustering_block
         render_embeddings_block(
             analyzer.dataset,
             candidate_text_cols=analyzer.text_columns,
             queries=analyzer.queries_df,
         )
         render_clustering_block()
+
+        if analyzer.dataset_name and analyzer.dataset_name.startswith("HF:"):
+            st.subheader("⬇️ Download Retrieved Docs JSON")
+            st.caption("Export retrieved passages in the same `{doc_id: {query_id, text}}` structure as save_json.py docs.json.")
+
+            hf_retrieval_top_k = st.number_input(
+                "Top-K docs per query for JSON export",
+                min_value=1,
+                max_value=100,
+                value=5,
+                step=1,
+                key="__hf_retrieval_top_k"
+            )
+            max_export_queries = st.number_input(
+                "Max queries to export (for speed)",
+                min_value=1,
+                max_value=100000,
+                value=1000,
+                step=100,
+                key="__hf_export_query_limit"
+            )
+
+            can_export = (
+                analyzer.queries_df is not None
+                and not analyzer.queries_df.empty
+                and "__embeddings" in st.session_state
+                and "__doc_ids" in st.session_state
+                and "__store" in st.session_state
+                and "__embedder_name" in st.session_state
+            )
+
+            if not can_export:
+                st.info("Build embeddings first and load a dataset with detectable query text to enable export.")
+            elif st.button("Prepare retrieved docs JSON", key="__prepare_hf_retrieval_json"):
+                export_queries = analyzer.queries_df[["query_id", "query_text"]].dropna().head(int(max_export_queries))
+
+                with st.spinner("Retrieving top documents for queries..."):
+                    q_embedder = TextEmbedder(model_name=st.session_state["__embedder_name"], normalize=False)
+                    retriever = CosineRetriever(
+                        embeddings=st.session_state["__embeddings"],
+                        doc_ids=st.session_state["__doc_ids"],
+                        store=st.session_state["__store"],
+                    )
+
+                    docs_payload = {}
+                    next_doc_id = 0
+                    for _, row in export_queries.iterrows():
+                        query_id = str(row["query_id"])
+                        query_text = str(row["query_text"])
+                        hits = retriever.search(query_text, q_embedder, k=int(hf_retrieval_top_k))
+                        for _, _, retrieved_text in hits:
+                            docs_payload[next_doc_id] = {
+                                "query_id": query_id,
+                                "text": str(retrieved_text),
+                            }
+                            next_doc_id += 1
+
+                    st.session_state["__hf_retrieved_docs_json"] = json.dumps(
+                        docs_payload,
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                    st.session_state["__hf_retrieved_docs_count"] = len(docs_payload)
+
+            if "__hf_retrieved_docs_json" in st.session_state:
+                st.success(
+                    f"Prepared {st.session_state.get('__hf_retrieved_docs_count', 0):,} retrieved docs for download."
+                )
+                st.download_button(
+                    "Download retrieved_docs.json",
+                    data=st.session_state["__hf_retrieved_docs_json"],
+                    file_name="retrieved_docs.json",
+                    mime="application/json",
+                    key="__download_hf_retrieved_docs_json"
+                )
 
         # Entropy module (document-level entropy via metrics.batch_entropy)
         render_entropy_module(analyzer)
