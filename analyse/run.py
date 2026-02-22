@@ -220,7 +220,7 @@ class DatasetAnalyzer:
 
         self.dataset = df
         self.dataset_name = f"HF:{path}" + (f"/{name}" if name else "") + f" [{split}]"
-        self.queries_df = None
+        self.queries_df = self._extract_queries_dataframe(df)
 
         self.text_columns = []
         for col in df.columns:
@@ -235,6 +235,41 @@ class DatasetAnalyzer:
                 self.target_column = guess
                 break
         return df
+
+    def _extract_queries_dataframe(self, df):
+        if df is None or df.empty:
+            return None
+
+        query_id_col = None
+        for candidate in ["query_id", "qid", "question_id", "id"]:
+            if candidate in df.columns:
+                query_id_col = candidate
+                break
+
+        query_text_col = None
+        for candidate in ["query", "query_text", "question", "question_text"]:
+            if candidate in df.columns:
+                query_text_col = candidate
+                break
+
+        if query_text_col is None:
+            return None
+
+        if query_id_col is None:
+            query_frame = df[[query_text_col]].dropna().copy()
+            query_frame = query_frame.rename(columns={query_text_col: "query_text"})
+            query_frame["query_id"] = [str(i) for i in range(len(query_frame))]
+        else:
+            query_frame = df[[query_id_col, query_text_col]].dropna().copy()
+            query_frame = query_frame.rename(columns={query_id_col: "query_id", query_text_col: "query_text"})
+
+        if query_frame.empty:
+            return None
+
+        query_frame["query_id"] = query_frame["query_id"].astype(str)
+        query_frame["query_text"] = query_frame["query_text"].astype(str)
+        query_frame = query_frame.drop_duplicates(subset=["query_id", "query_text"]).reset_index(drop=True)
+        return query_frame if not query_frame.empty else None
 
     def get_basic_info(self):
         if self.dataset is None:
@@ -816,6 +851,55 @@ def main():
             queries=analyzer.queries_df,
         )
         render_clustering_block()
+
+        if analyzer.dataset_name and analyzer.dataset_name.startswith("HF:"):
+            st.subheader("⬇️ Download docs.json (save_json.py compatible)")
+            st.caption("Export docs in save_json.py format: `{doc_id: {query_id, text, ...}}`, where `query_id` comes from the source dataset row.")
+            st.caption("UI marker: `hf-docs-export-v2` (if you still see `Download Retrieved Docs JSON`, restart Streamlit on the latest commit).")
+
+            export_doc_count = st.number_input(
+                "Number of docs to export",
+                min_value=1,
+                max_value=2000000,
+                value=20000,
+                step=1000,
+                key="__hf_docs_export_count"
+            )
+
+            if st.button("Prepare docs.json", key="__prepare_hf_docs_json"):
+                with st.spinner("Flattening HF dataset to docs.json format..."):
+                    try:
+                        from save_json import load_and_flatten
+
+                        rows = analyzer.dataset.to_dict(orient="records")
+                        docs_payload = load_and_flatten(rows)
+
+                        if export_doc_count is not None and export_doc_count >= 0:
+                            docs_payload = {
+                                doc_id: payload
+                                for doc_id, payload in list(docs_payload.items())[: int(export_doc_count)]
+                            }
+
+                        st.session_state["__hf_docs_json"] = json.dumps(
+                            docs_payload,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
+                        st.session_state["__hf_docs_count"] = len(docs_payload)
+                    except Exception as export_error:
+                        st.error(f"Failed to prepare docs.json: {export_error}")
+
+            if "__hf_docs_json" in st.session_state:
+                st.success(
+                    f"Prepared {st.session_state.get('__hf_docs_count', 0):,} docs for download."
+                )
+                st.download_button(
+                    "Download docs.json",
+                    data=st.session_state["__hf_docs_json"],
+                    file_name="docs.json",
+                    mime="application/json",
+                    key="__download_hf_docs_json"
+                )
 
         # Entropy module (document-level entropy via metrics.batch_entropy)
         render_entropy_module(analyzer)
