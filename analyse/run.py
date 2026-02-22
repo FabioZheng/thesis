@@ -853,8 +853,9 @@ def main():
         render_clustering_block()
 
         if analyzer.dataset_name and analyzer.dataset_name.startswith("HF:"):
-            st.subheader("⬇️ Download docs.json")
+            st.subheader("⬇️ Download docs.json (save_json.py compatible)")
             st.caption("Export docs in save_json.py format: `{doc_id: {query_id, text, ...}}`, where `query_id` comes from the source dataset row.")
+            st.caption("UI marker: `hf-docs-export-v2` (if you still see `Download Retrieved Docs JSON`, restart Streamlit on the latest commit).")
 
             export_doc_count = st.number_input(
                 "Number of docs to export",
