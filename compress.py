@@ -90,6 +90,14 @@ def parse_args() -> argparse.Namespace:
         default="data",
     )
     parser.add_argument(
+        "--noquery",
+        action="store_true",
+        help=(
+            "Skip writing queries.json, answers.json, and query embeddings; only "
+            "generate document outputs (docs, contexts, and doc embeddings)."
+        ),
+    )
+    parser.add_argument(
         "--use-bandit",
         dest="use_bandit",
         action="store_true",
@@ -586,46 +594,52 @@ def main() -> None:
         )
     )
 
-    query_ids = {
-        payload["query_id"]
-        for payload in docs.values()
-        if payload.get("query_id") is not None
-    }
-    queries_source = dataset_builder()
-    queries_path, queries_mem = save_queries_json(
-        queries_source,
-        args.docs_out,
-        "queries.json",
-        query_ids=query_ids or None,
-    )
-    print(
-        "Extracted {count} queries -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=queries_mem.get("count", 0),
-            path=queries_path,
-            mem=queries_mem.get("approx_memory_mb", 0.0),
-            pickle=queries_mem.get("pickle_disk_mb", 0.0),
-            json=queries_mem.get("json_disk_mb", 0.0),
+    queries_path: Optional[str] = None
+    if args.noquery:
+        print(
+            "--noquery enabled: skipping queries.json, answers.json, and query embeddings generation."
         )
-    )
+    else:
+        query_ids = {
+            payload["query_id"]
+            for payload in docs.values()
+            if payload.get("query_id") is not None
+        }
+        queries_source = dataset_builder()
+        queries_path, queries_mem = save_queries_json(
+            queries_source,
+            args.docs_out,
+            "queries.json",
+            query_ids=query_ids or None,
+        )
+        print(
+            "Extracted {count} queries -> {path} "
+            "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+                count=queries_mem.get("count", 0),
+                path=queries_path,
+                mem=queries_mem.get("approx_memory_mb", 0.0),
+                pickle=queries_mem.get("pickle_disk_mb", 0.0),
+                json=queries_mem.get("json_disk_mb", 0.0),
+            )
+        )
 
-    answers_source = dataset_builder()
-    answers_path, answers_mem = save_answers_json(
-        answers_source,
-        args.docs_out,
-        "answers.json",
-        query_ids=query_ids or None,
-    )
-    print(
-        "Extracted {count} answers -> {path} "
-        "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
-            count=answers_mem.get("count", 0),
-            path=answers_path,
-            mem=answers_mem.get("approx_memory_mb", 0.0),
-            pickle=answers_mem.get("pickle_disk_mb", 0.0),
-            json=answers_mem.get("json_disk_mb", 0.0),
+        answers_source = dataset_builder()
+        answers_path, answers_mem = save_answers_json(
+            answers_source,
+            args.docs_out,
+            "answers.json",
+            query_ids=query_ids or None,
         )
-    )
+        print(
+            "Extracted {count} answers -> {path} "
+            "(approx memory: {mem:.2f} MB, pickle: {pickle:.2f} MB, json: {json:.2f} MB)".format(
+                count=answers_mem.get("count", 0),
+                path=answers_path,
+                mem=answers_mem.get("approx_memory_mb", 0.0),
+                pickle=answers_mem.get("pickle_disk_mb", 0.0),
+                json=answers_mem.get("json_disk_mb", 0.0),
+            )
+        )
 
     if args.checkpoint and args.hf_model_name:
         raise ValueError("Specify either --checkpoint or --hf_model_name, not both")
@@ -706,8 +720,22 @@ def main() -> None:
         )
     )
 
+    if args.noquery:
+        return
+
+    if queries_path is None:
+        print("Queries path is unavailable; skipping query embedding generation.")
+        return
+
     with open(queries_path, "r", encoding="utf-8") as handle:
         queries_payload = json.load(handle)
+
+    if not queries_payload:
+        print(
+            "No query text payloads were extracted from the dataset source; "
+            "skipping query embedding generation."
+        )
+        return
 
     query_ids_array, query_texts_array, query_embeddings = generate_query_embeddings(
         queries_payload,

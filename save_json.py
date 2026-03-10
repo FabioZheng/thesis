@@ -254,6 +254,32 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
     if isinstance(dataset_source, str):
         if not os.path.isfile(dataset_source):
             raise FileNotFoundError(f"Dataset file not found: {dataset_source}")
+        _, extension = os.path.splitext(dataset_source)
+        extension = extension.lower()
+
+        if extension == ".json":
+            with open(dataset_source, "r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+
+            if isinstance(payload, Mapping):
+                values = list(payload.values())
+                if all(isinstance(value, Mapping) for value in values):
+                    for value in values:
+                        yield dict(value)
+                    return
+
+            if isinstance(payload, list):
+                for item in payload:
+                    if isinstance(item, Mapping):
+                        yield dict(item)
+                    else:
+                        yield {"text": str(item)}
+                return
+
+            raise TypeError(
+                "Unsupported JSON structure in dataset file; expected an object or array."
+            )
+
         frame = pd.read_json(dataset_source, lines=True)
         for row in frame.to_dict(orient="records"):
             yield row
@@ -283,6 +309,54 @@ def _iter_rows(dataset_source: RowIterable) -> Iterable[Mapping[str, Any]]:
             yield dict(row)
 
 
+
+
+def _looks_like_local_path(value: str) -> bool:
+    expanded = os.path.expanduser(value)
+    return (
+        os.path.sep in expanded
+        or (os.path.altsep is not None and os.path.altsep in expanded)
+        or expanded.startswith(".")
+        or expanded.startswith("~")
+        or os.path.splitext(expanded)[1].lower() in {".json", ".jsonl", ".ndjson"}
+    )
+
+
+def _resolve_dataset_source(
+    dataset_source: RowIterable,
+    *,
+    split: str | None = None,
+    name: str | None = None,
+    load_dataset_kwargs: Mapping[str, Any] | None = None,
+) -> RowIterable:
+    if not isinstance(dataset_source, str):
+        return dataset_source
+
+    expanded_source = os.path.expanduser(dataset_source)
+    if os.path.isfile(expanded_source):
+        return expanded_source
+
+    if _looks_like_local_path(dataset_source):
+        raise FileNotFoundError(
+            f"Dataset file not found: {dataset_source} (resolved: {os.path.abspath(expanded_source)})"
+        )
+
+    dataset_identifier = dataset_source
+    load_kwargs = dict(load_dataset_kwargs or {})
+    if split is not None:
+        load_kwargs.setdefault("split", split)
+    if name is not None:
+        load_kwargs.setdefault("name", name)
+
+    try:
+        return load_dataset(dataset_identifier, **load_kwargs)
+    except Exception as error:  # pragma: no cover - network/IO heavy
+        raise ValueError(
+            "Failed to load dataset using datasets.load_dataset; "
+            f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
+        ) from error
+
+
 def load_and_flatten(
     dataset_source: RowIterable,
     *,
@@ -307,21 +381,12 @@ def load_and_flatten(
     original row.
     """
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
@@ -334,12 +399,20 @@ def load_and_flatten(
         row_iterable = islice(row_iterable, limit)
 
     for row in tqdm(row_iterable, desc="Flattening dataset", unit="row"):
+        row_keys = {
+            key.lower() for key in row.keys() if isinstance(key, str)
+        }
         query_id = _extract_query_id(row)
         passage_texts = _extract_passage_texts(row)
         if not passage_texts and "text" in row:
             passage_texts = _flatten_text_container(row["text"])
         answer_texts = _extract_answer_texts(row)
-        if _is_placeholder_only_answers(answer_texts):
+        is_preflattened_record = (
+            "text" in row_keys
+            and query_id is not None
+            and not any(key in row_keys for key in ANSWER_CONTAINER_KEYS_LOWER)
+        )
+        if _is_placeholder_only_answers(answer_texts) and not is_preflattened_record:
             continue
         answer_texts = _filter_placeholder_answers(answer_texts)
 
@@ -377,21 +450,12 @@ def load_queries(
 ) -> Dict[str, Dict[str, str]]:
     """Load a dataset-like object and extract a mapping of query_id to text."""
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
@@ -427,21 +491,12 @@ def load_answers(
 ) -> Dict[str, list[str]]:
     """Load a dataset-like object and map each query_id to its answer texts."""
 
-    if isinstance(dataset_source, str) and not os.path.isfile(dataset_source):
-        dataset_identifier = dataset_source
-        load_kwargs = dict(load_dataset_kwargs or {})
-        if split is not None:
-            load_kwargs.setdefault("split", split)
-        if name is not None:
-            load_kwargs.setdefault("name", name)
-
-        try:
-            dataset_source = load_dataset(dataset_identifier, **load_kwargs)
-        except Exception as error:  # pragma: no cover - network/IO heavy
-            raise ValueError(
-                "Failed to load dataset using datasets.load_dataset; "
-                f"dataset='{dataset_identifier}', split='{split}', name='{name}'."
-            ) from error
+    dataset_source = _resolve_dataset_source(
+        dataset_source,
+        split=split,
+        name=name,
+        load_dataset_kwargs=load_dataset_kwargs,
+    )
 
     if limit is not None and limit < 0:
         raise ValueError("limit must be non-negative")
